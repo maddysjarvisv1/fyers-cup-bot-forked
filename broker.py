@@ -41,21 +41,21 @@ class PaperBroker:
         return oid
 
     # ---- order placement (return order id) ----
-    def _place_stop(self, symbol, qty, trigger, side):
+    def _place_stop(self, symbol, qty, trigger, side, order_tag="cupbot"):
         oid = self._oid()
         self.s["orders"].append({
             "id": oid, "symbol": symbol.upper(), "qty": int(qty),
             "side": side, "type": "SL-M", "trigger": float(trigger),
-            "status": "pending", "placed_at": _now(),
+            "tag": order_tag, "status": "pending", "placed_at": _now(),
         })
         self._save()
         return oid
 
-    def place_buy_stop(self, symbol, qty, trigger):
-        return self._place_stop(symbol, qty, trigger, "BUY")
+    def place_buy_stop(self, symbol, qty, trigger, order_tag="cupbot"):
+        return self._place_stop(symbol, qty, trigger, "BUY", order_tag)
 
-    def place_sell_stop(self, symbol, qty, trigger):
-        return self._place_stop(symbol, qty, trigger, "SELL")
+    def place_sell_stop(self, symbol, qty, trigger, order_tag="cupbot"):
+        return self._place_stop(symbol, qty, trigger, "SELL", order_tag)
 
     def modify_stop(self, order_id, new_trigger):
         for o in self.s["orders"]:
@@ -151,11 +151,11 @@ class LiveBroker:
     def __init__(self, client):
         self.c = client  # FyersClient
 
-    def place_buy_stop(self, symbol, qty, trigger):
-        return self.c.place_buy_stop(symbol, qty, trigger)
+    def place_buy_stop(self, symbol, qty, trigger, order_tag="cupbot"):
+        return self.c.place_buy_stop(symbol, qty, trigger, order_tag=order_tag)
 
-    def place_sell_stop(self, symbol, qty, trigger):
-        return self.c.place_sell_stop(symbol, qty, trigger)
+    def place_sell_stop(self, symbol, qty, trigger, order_tag="cupbot"):
+        return self.c.place_sell_stop(symbol, qty, trigger, order_tag=order_tag)
 
     def modify_stop(self, order_id, new_trigger):
         return self.c.modify_order(order_id, stopPrice=float(new_trigger))

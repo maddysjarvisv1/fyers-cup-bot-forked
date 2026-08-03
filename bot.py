@@ -22,8 +22,9 @@ def log(msg):
 
 class CupBot:
     def __init__(self, broker, price_source, watchlist, state_path="bot_state.json",
-                 near_pct=NEAR_PCT, verbose=True, mode="PAPER", alerts=False):
+                 near_pct=NEAR_PCT, verbose=True, mode="PAPER", alerts=False, tag="cup"):
         self.broker = broker
+        self.tag = tag                       # order tag / Algo-ID identifier
         self.price_source = price_source     # callable(symbols)->{SYM: ltp}
         self.watchlist = watchlist           # [{symbol, rim, trigger, qty}]
         self.near = near_pct
@@ -68,7 +69,7 @@ class CupBot:
             ltp = prices.get(sym)
             if ltp is None or ltp >= trig or ltp < rim * (1 - self.near):
                 continue
-            self.broker.place_buy_stop(sym, qty, trig)
+            self.broker.place_buy_stop(sym, qty, trig, order_tag=self.tag)
             if self.verbose:
                 log(f"  ARM   {sym}: ltp {ltp} within 1% of rim {rim} -> buy-stop @ {trig} x{qty}")
             self._alert("armed", sym, ltp, trig, qty)
@@ -79,7 +80,7 @@ class CupBot:
             sym = f["symbol"]
             if f["reason"] == "ENTRY":
                 st = sl.PosState(entry=f["price"], qty_total=f["qty"], qty_remaining=f["qty"])
-                sid = self.broker.place_sell_stop(sym, f["qty"], st.sl)
+                sid = self.broker.place_sell_stop(sym, f["qty"], st.sl, order_tag=self.tag)
                 self.pos_state[sym] = {"state": asdict(st), "sell_stop_id": sid}
                 if self.verbose:
                     log(f"  ENTRY {sym} filled @ {f['price']} x{f['qty']}  -> initial SL {st.sl} (sell-stop {sid})")
@@ -109,7 +110,7 @@ class CupBot:
                 q, px = booked[0][1], booked[0][2]
                 self.broker.market_sell(sym, q, px)
                 self.broker.cancel(ps["sell_stop_id"])
-                ps["sell_stop_id"] = self.broker.place_sell_stop(sym, st.qty_remaining, st.sl)
+                ps["sell_stop_id"] = self.broker.place_sell_stop(sym, st.qty_remaining, st.sl, order_tag=self.tag)
                 if self.verbose:
                     log(f"  BOOK  {sym} +20%: sold {q} @ {px}; trail SL -> {st.sl}, keep {st.qty_remaining}")
                 self._alert("partial", sym, q, px, st.sl, st.qty_remaining)

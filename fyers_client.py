@@ -20,12 +20,33 @@ def load_env(path=".env"):
     return cfg
 
 
+# Symbols that trade in NSE's "BE" (Trade-to-Trade) series use -BE, not -EQ.
+# NOTE: T2T stocks are delivery-only — no intraday square-off, so a same-day
+# stop-loss cannot execute (you can only sell after T+1 delivery). Trade with care.
+SYMBOL_OVERRIDES = {
+    "BAFNAPH": "NSE:BAFNAPH-BE",
+    "SANGINITA": "NSE:SANGINITA-BE",
+    "SWANDEF": "NSE:SWANDEF-BE",
+    "UNIVASTU": "NSE:UNIVASTU-BE",
+    "VIJIFIN": "NSE:VIJIFIN-BE",
+    "WELINV": "NSE:WELINV-BE",
+}
+
+
 def nse(symbol: str) -> str:
-    """Plain symbol -> Fyers NSE equity symbol. SOTL -> NSE:SOTL-EQ."""
+    """Plain symbol -> Fyers symbol. SOTL -> NSE:SOTL-EQ; BE-series via overrides."""
     symbol = symbol.upper().strip()
-    if symbol.startswith("NSE:"):
+    if symbol.startswith("NSE:") or symbol.startswith("BSE:"):
         return symbol
+    if symbol in SYMBOL_OVERRIDES:
+        return SYMBOL_OVERRIDES[symbol]
     return f"NSE:{symbol}-EQ"
+
+
+def plain(fyers_symbol: str) -> str:
+    """Fyers symbol -> plain. NSE:SOTL-EQ -> SOTL; NSE:BAFNAPH-BE -> BAFNAPH."""
+    s = fyers_symbol.split(":")[-1]
+    return s.rsplit("-", 1)[0] if "-" in s else s
 
 
 class FyersClient:
@@ -63,12 +84,12 @@ class FyersClient:
             chunk = symbols[i:i + 50]
             resp = self.quotes(chunk)
             for d in (resp.get("d") or []):
-                n = d.get("n", "")                       # e.g. NSE:SOTL-EQ
-                plain = n.split(":")[-1].replace("-EQ", "")
+                n = d.get("n", "")                       # e.g. NSE:SOTL-EQ / NSE:BAFNAPH-BE
+                p = plain(n)
                 v = (d.get("v") or {})
                 ltp = v.get("lp")
-                if plain and ltp is not None:
-                    out[plain] = float(ltp)
+                if p and ltp is not None:
+                    out[p] = float(ltp)
         return out
 
     def positions(self):
@@ -78,8 +99,9 @@ class FyersClient:
         return self.fy.orderbook()
 
     # ---- order placement (REAL money — use deliberately) ----
-    def place_buy_stop(self, symbol, qty, trigger, product="CNC"):
-        """SL-M BUY (buy-stop). Fyers: type=3 (Stop/SL-M), side=1 (buy)."""
+    def place_buy_stop(self, symbol, qty, trigger, product="CNC", order_tag="cupbot"):
+        """SL-M BUY (buy-stop). Fyers: type=3 (Stop/SL-M), side=1 (buy).
+        order_tag -> Fyers orderTag (strategy identifier; the Algo-ID hook)."""
         data = {
             "symbol": nse(symbol),
             "qty": int(qty),
@@ -90,15 +112,16 @@ class FyersClient:
             "stopPrice": float(trigger),
             "validity": "DAY",
             "offlineOrder": False,
+            "orderTag": str(order_tag)[:20],
         }
         return self.fy.place_order(data)
 
-    def place_sell_stop(self, symbol, qty, trigger, product="CNC"):
+    def place_sell_stop(self, symbol, qty, trigger, product="CNC", order_tag="cupbot"):
         """SL-M SELL (stop-loss). type=3, side=-1."""
         data = {
             "symbol": nse(symbol), "qty": int(qty), "type": 3, "side": -1,
             "productType": product, "limitPrice": 0, "stopPrice": float(trigger),
-            "validity": "DAY", "offlineOrder": False,
+            "validity": "DAY", "offlineOrder": False, "orderTag": str(order_tag)[:20],
         }
         return self.fy.place_order(data)
 

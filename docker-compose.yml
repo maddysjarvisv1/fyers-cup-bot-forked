@@ -1,0 +1,14 @@
+services:
+  cupbot:
+    build: .
+    container_name: cupbot
+    restart: unless-stopped
+    # Bind the project dir so .env, token.json, watchlist.csv and the state files
+    # live on the host (secrets never baked into the image; state persists across restarts).
+    # token.json is a DAILY Fyers token — regenerate on the host with `python auth.py`
+    # each trading morning; the container picks it up automatically.
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: python run.py
+    # MODE=paper by default (from .env). To go live: MODE=live + CONFIRM_LIVE=YES in .env.

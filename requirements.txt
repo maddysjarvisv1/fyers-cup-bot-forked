@@ -1,0 +1,12 @@
+# Core deps (all have Python 3.13 wheels). Install these first:
+#     pip install -r requirements.txt
+aiohttp>=3.10
+requests>=2.31
+websocket-client
+requests-toolbelt
+aws_lambda_powertools
+setuptools<80          # 81+ removed pkg_resources, which the Fyers websocket needs
+
+# fyers-apiv3 pins aiohttp==3.9.3 (no 3.13 wheel, won't build), so install it
+# WITHOUT deps, AFTER the above:
+#     pip install --no-deps fyers-apiv3==3.1.15

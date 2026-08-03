@@ -1,0 +1,14 @@
+# SECRETS — never commit
+.env
+token.json
+
+# runtime state / logs
+paper_state.json
+bot_state.json
+*.log
+logs/
+
+# python
+.venv/
+__pycache__/
+*.pyc

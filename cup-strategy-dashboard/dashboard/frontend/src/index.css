@@ -1,0 +1,50 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:       #0d0f14;
+  --surface:  #161a22;
+  --border:   #232836;
+  --muted:    #3a4055;
+  --text:     #e2e8f0;
+  --sub:      #8892a4;
+  --green:    #22c55e;
+  --red:      #ef4444;
+  --amber:    #f59e0b;
+  --blue:     #3b82f6;
+  --purple:   #a855f7;
+  --accent:   #f59e0b;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+input, select, textarea {
+  font-family: inherit;
+  font-size: 13px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 10px;
+  outline: none;
+}
+
+input:focus, select:focus {
+  border-color: var(--accent);
+}
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--muted); border-radius: 3px; }

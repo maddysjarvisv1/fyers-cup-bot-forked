@@ -1,0 +1,38 @@
+version: "3.9"
+
+services:
+  scanner:
+    build: ./scanner
+    container_name: cup_scanner
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./database:/app/database
+    depends_on: []
+    networks:
+      - cup_net
+
+  backend:
+    build: ./dashboard/backend
+    container_name: cup_backend
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./database:/app/database
+    networks:
+      - cup_net
+
+  frontend:
+    build: ./dashboard/frontend
+    container_name: cup_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    networks:
+      - cup_net
+
+networks:
+  cup_net:
+    driver: bridge

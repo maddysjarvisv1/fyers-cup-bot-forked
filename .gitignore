@@ -12,3 +12,12 @@ logs/
 .venv/
 __pycache__/
 *.pyc
+
+# node / frontend
+node_modules/
+dist/
+
+# databases / data dumps
+*.db
+*.sqlite
+*.sqlite3

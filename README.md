@@ -1,5 +1,11 @@
 # cup-bot — lean Fyers ATH cup-breakout bot
 
+> This repo has two related projects:
+> - **This root** — the lean Fyers execution bot (see below).
+> - **[`cup-strategy-dashboard/`](cup-strategy-dashboard/)** — the earlier full watchlist/dashboard
+>   app (FastAPI + React) that the bot's `watchlist.csv` is derived from. See its own README
+>   inside that folder for setup.
+
 A self-owned algo bot for the Malkansview ATH cup-breakout strategy on NSE.
 Direct **Fyers** API (`fyers-apiv3`), ~20 packages, no heavyweight platform.
 **Paper mode** (simulated fills vs live quotes) and **live mode** share one code path.

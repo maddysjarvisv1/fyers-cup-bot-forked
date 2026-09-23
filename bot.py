@@ -20,6 +20,25 @@ def log(msg):
     print(msg, flush=True)
 
 
+# === FIX(live-risk): a live order op failed — surface it so the runner raises,
+# rather than silently continuing with a stale/missing stop-loss.
+class LiveOrderError(Exception):
+    """Raised when a live broker order operation fails."""
+
+
+def _request_ok(result):
+    """True when a broker operation result indicates success.
+
+    PaperBroker mutators return None (success); LiveBroker returns a Fyers-style
+    dict {"s": "ok"|"error", ...}; place_* return an order id (truthy on success).
+    """
+    if result is None:
+        return True
+    if isinstance(result, dict):
+        return str(result.get("s", "")).lower() != "error"
+    return bool(result)
+
+
 class CupBot:
     def __init__(self, broker, price_source, watchlist, state_path="bot_state.json",
                  near_pct=NEAR_PCT, verbose=True, mode="PAPER", alerts=False, tag="cup"):
@@ -33,6 +52,9 @@ class CupBot:
         self.mode = mode                     # "PAPER" | "LIVE" (for alert tags)
         self.alerts = alerts                 # send Telegram alerts?
         self.pos_state = {}                  # SYM -> {"state": {...}, "sell_stop_id": id}
+        # === FIX(live-risk): track symbols whose entry buy-stop was placed this
+        # session but whose fill has not yet produced a position (in-flight).
+        self._in_flight = set()
         if os.path.exists(state_path):
             self.pos_state = json.load(open(state_path))
 
@@ -44,6 +66,12 @@ class CupBot:
     def _save(self):
         json.dump(self.pos_state, open(self.state_path, "w"), indent=2)
 
+    # === FIX(live-risk): verify a live broker op result and raise on failure so
+    # the runner surfaces it instead of continuing with a stale SL.
+    def _check_live(self, result, op, sym):
+        if self.mode == "LIVE" and not _request_ok(result):
+            raise LiveOrderError(f"LIVE {op} failed for {sym}: {result!r}")
+
     def _syms(self):
         s = {w["symbol"] for w in self.watchlist}
         s |= {p["symbol"] for p in self.broker.positions()}
@@ -53,10 +81,51 @@ class CupBot:
         prices = self.price_source(self._syms())
         fills = self.broker.feed(prices)          # paper: process resting stops
         self._on_fills(fills)
+        self._reconcile_live()
         self._entry_pass(prices)
         self._exit_pass(prices)
         self._save()
         return prices, fills
+
+    # === FIX(live-risk): reconcile live positions with local pos_state, since
+    # LiveBroker.feed() returns [] and _on_fills never fires in live mode.
+    def _reconcile_live(self):
+        if self.mode != "LIVE":
+            return
+        positions = self.broker.positions()
+        # positions() already returns only filled net positions, so a symbol that
+        # is merely a just-placed-pending buy order (no fill yet) is absent here.
+        pos_by_sym = {p["symbol"]: p for p in positions}
+
+        # NEW POSITION -> ENTRY: create PosState + place the protective sell-stop
+        for sym, p in pos_by_sym.items():
+            if sym in self.pos_state:
+                continue  # already managed (no duplicate SELL-stop)
+            st = sl.PosState(entry=p["avg"], qty_total=p["qty"], qty_remaining=p["qty"])
+            sid = self.broker.place_sell_stop(sym, p["qty"], st.sl, order_tag=self.tag)
+            self._check_live(sid, "place_sell_stop", sym)
+            self.pos_state[sym] = {"state": asdict(st), "sell_stop_id": sid}
+            self._in_flight.discard(sym)
+            if self.verbose:
+                log(f"  ENTRY {sym} reconciled @ {p['avg']} x{p['qty']} -> initial SL {st.sl} (sell-stop {sid})")
+            self._alert("entry", sym, p["avg"], p["qty"], st.sl)
+
+        # POSITION GONE -> STOP_EXIT cleanup (do NOT create a phantom sell-stop)
+        for sym in list(self.pos_state):
+            ps = self.pos_state.get(sym)
+            if not ps:
+                continue
+            st = ps.get("state") or {}
+            if (st.get("qty_remaining", 0) > 0) and sym not in pos_by_sym:
+                entry = st.get("entry", 0.0)
+                qty = st.get("qty_total", st.get("qty_remaining", 0))
+                exit_px = st.get("sl", entry)
+                pnl = (exit_px - entry) * qty
+                if self.verbose:
+                    log(f"  EXIT  {sym} reconciled gone @ {exit_px} x{qty}")
+                self._alert("exit_", sym, exit_px, qty, pnl)
+                self.pos_state.pop(sym, None)
+                self._in_flight.discard(sym)
 
     # -- entry: arm buy-stop only for near-rim, uncrossed, not-already-handled --
     def _entry_pass(self, prices):
@@ -64,12 +133,15 @@ class CupBot:
         have |= {o["symbol"] for o in self.broker.open_orders()}
         for w in self.watchlist:
             sym, rim, trig, qty = w["symbol"], float(w["rim"]), float(w["trigger"]), int(w["qty"])
-            if sym in have:
+            # === FIX(live-risk): re-arm guard — skip symbols already held, in
+            # pos_state, or whose fill is still in-flight (no duplicate buy-stop).
+            if sym in have or sym in self.pos_state or sym in self._in_flight:
                 continue
             ltp = prices.get(sym)
             if ltp is None or ltp >= trig or ltp < rim * (1 - self.near):
                 continue
             self.broker.place_buy_stop(sym, qty, trig, order_tag=self.tag)
+            self._in_flight.add(sym)
             if self.verbose:
                 log(f"  ARM   {sym}: ltp {ltp} within 1% of rim {rim} -> buy-stop @ {trig} x{qty}")
             self._alert("armed", sym, ltp, trig, qty)
@@ -82,6 +154,7 @@ class CupBot:
                 st = sl.PosState(entry=f["price"], qty_total=f["qty"], qty_remaining=f["qty"])
                 sid = self.broker.place_sell_stop(sym, f["qty"], st.sl, order_tag=self.tag)
                 self.pos_state[sym] = {"state": asdict(st), "sell_stop_id": sid}
+                self._in_flight.discard(sym)
                 if self.verbose:
                     log(f"  ENTRY {sym} filled @ {f['price']} x{f['qty']}  -> initial SL {st.sl} (sell-stop {sid})")
                 self._alert("entry", sym, f["price"], f["qty"], st.sl)
@@ -92,6 +165,7 @@ class CupBot:
                     log(f"  EXIT  {sym} stop hit @ {f['price']} x{f['qty']}")
                 self._alert("exit_", sym, f["price"], f["qty"], pnl)
                 self.pos_state.pop(sym, None)
+                self._in_flight.discard(sym)
 
     # -- exit mgmt: run SL engine, trail the resting sell-stop, book partials --
     def _exit_pass(self, prices):
@@ -108,14 +182,24 @@ class CupBot:
             booked = [a for a in actions if a[0] == "book_partial"]
             if booked:
                 q, px = booked[0][1], booked[0][2]
-                self.broker.market_sell(sym, q, px)
-                self.broker.cancel(ps["sell_stop_id"])
-                ps["sell_stop_id"] = self.broker.place_sell_stop(sym, st.qty_remaining, st.sl, order_tag=self.tag)
+                # === FIX(live-risk): verify market_sell/cancel and only place the
+                # new trail sell-stop AFTER the old one is confirmed cancelled —
+                # otherwise we'd hold a stale SL or double-place a SELL-stop.
+                res = self.broker.market_sell(sym, q, px)
+                self._check_live(res, "market_sell", sym)
+                res = self.broker.cancel(ps["sell_stop_id"])
+                self._check_live(res, "cancel", sym)
+                sid = self.broker.place_sell_stop(sym, st.qty_remaining, st.sl, order_tag=self.tag)
+                self._check_live(sid, "place_sell_stop", sym)
+                ps["sell_stop_id"] = sid
                 if self.verbose:
                     log(f"  BOOK  {sym} +20%: sold {q} @ {px}; trail SL -> {st.sl}, keep {st.qty_remaining}")
                 self._alert("partial", sym, q, px, st.sl, st.qty_remaining)
             elif st.sl != prev_sl:
-                self.broker.modify_stop(ps["sell_stop_id"], st.sl)
+                # === FIX(live-risk): verify modify_stop in live mode, else a
+                # stale SL would silently keep protecting at the old level.
+                res = self.broker.modify_stop(ps["sell_stop_id"], st.sl)
+                self._check_live(res, "modify_stop", sym)
                 if self.verbose:
                     tag = "breakeven" if prev_phase == "ACTIVE" else "trail"
                     log(f"  SL    {sym} {tag}: SL {prev_sl} -> {st.sl} (high {st.highest})")

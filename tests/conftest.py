@@ -16,6 +16,11 @@ sys.modules["notify"] = _notify
 
 EVENTS = ["armed", "entry", "breakeven", "partial", "trail", "exit_", "error"]
 
+# Seed no-op handlers so a test that runs a cycle without requesting the
+# alert_log fixture never trips an AttributeError on the shared fake module.
+for _n in EVENTS:
+    setattr(_notify, _n, lambda *a, **k: None)
+
 
 class LiveBrokerDouble:
     """A controllable double with the LiveBroker interface.
@@ -34,7 +39,8 @@ class LiveBrokerDouble:
         # call records
         self.placed = []      # (side, symbol, qty, trigger)
         self.modified = []    # (order_id, new_trigger)
-        self.cancelled = []   # order_id
+        self.cancelled = []   # order_id (successful cancels)
+        self.cancel_attempts = []  # order_id (every cancel call, success or not)
         self.sold = []        # (symbol, qty, price)
         self.calls = []       # chronological op-name log (for call-order asserts)
 
@@ -64,8 +70,8 @@ class LiveBrokerDouble:
     def place_buy_stop(self, symbol, qty, trigger, order_tag="cupbot"):
         self.calls.append("place_buy_stop")
         r = self._result("place_buy_stop")
-        if r["s"] == "error":
-            return r
+        if r["s"] == "error" or self._symbol_fails("place_buy_stop", symbol):
+            return {"s": "error", "code": 500, "message": "place_buy_stop failed"}
         self.placed.append(("BUY", symbol, qty, trigger))
         oid = self._oid()
         self.pending.append({"id": oid, "symbol": symbol, "qty": qty,
@@ -93,10 +99,13 @@ class LiveBrokerDouble:
 
     def cancel(self, order_id):
         self.calls.append("cancel")
+        self.cancel_attempts.append(order_id)
         r = self._result("cancel")
         if r["s"] == "error":
             return r
         self.cancelled.append(order_id)
+        # a real broker cancel removes the resting order from the book
+        self.pending = [o for o in self.pending if o["id"] != order_id]
         return r
 
     def market_sell(self, symbol, qty, price):

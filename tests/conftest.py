@@ -14,7 +14,7 @@ import pytest
 _notify = types.ModuleType("notify")
 sys.modules["notify"] = _notify
 
-EVENTS = ["armed", "entry", "breakeven", "partial", "trail", "exit_"]
+EVENTS = ["armed", "entry", "breakeven", "partial", "trail", "exit_", "error"]
 
 
 class LiveBrokerDouble:
@@ -36,8 +36,12 @@ class LiveBrokerDouble:
         self.modified = []    # (order_id, new_trigger)
         self.cancelled = []   # order_id
         self.sold = []        # (symbol, qty, price)
+        self.calls = []       # chronological op-name log (for call-order asserts)
 
         self.fail = {}        # op -> True (fail next call) | "always"
+        self.fail_symbols = {}  # op -> set(symbol) that fails (per-symbol failure)
+        self.positions_error = False  # when True, positions() raises
+        self.dict_order_ids = False   # when True, place_* return {"s":"ok","id":oid}
 
     # ---- controllable failure injection -------------------------------------
     def _result(self, op):
@@ -54,24 +58,33 @@ class LiveBrokerDouble:
         return oid
 
     # ---- order placement (return order id on success) -----------------------
+    def _symbol_fails(self, op, symbol):
+        return symbol.upper() in {s.upper() for s in self.fail_symbols.get(op, ())}
+
     def place_buy_stop(self, symbol, qty, trigger, order_tag="cupbot"):
+        self.calls.append("place_buy_stop")
+        r = self._result("place_buy_stop")
+        if r["s"] == "error":
+            return r
         self.placed.append(("BUY", symbol, qty, trigger))
         oid = self._oid()
         self.pending.append({"id": oid, "symbol": symbol, "qty": qty,
                              "trigger": trigger, "side": "BUY", "status": "pending"})
-        return oid
+        return {"s": "ok", "id": oid} if self.dict_order_ids else oid
 
     def place_sell_stop(self, symbol, qty, trigger, order_tag="cupbot"):
+        self.calls.append("place_sell_stop")
         r = self._result("place_sell_stop")
-        if r["s"] == "error":
-            return r
+        if r["s"] == "error" or self._symbol_fails("place_sell_stop", symbol):
+            return {"s": "error", "code": 500, "message": "place_sell_stop failed"}
         self.placed.append(("SELL", symbol, qty, trigger))
         oid = self._oid()
         self.pending.append({"id": oid, "symbol": symbol, "qty": qty,
                              "trigger": trigger, "side": "SELL", "status": "pending"})
-        return oid
+        return {"s": "ok", "id": oid} if self.dict_order_ids else oid
 
     def modify_stop(self, order_id, new_trigger):
+        self.calls.append("modify_stop")
         r = self._result("modify_stop")
         if r["s"] == "error":
             return r
@@ -79,6 +92,7 @@ class LiveBrokerDouble:
         return r
 
     def cancel(self, order_id):
+        self.calls.append("cancel")
         r = self._result("cancel")
         if r["s"] == "error":
             return r
@@ -86,6 +100,7 @@ class LiveBrokerDouble:
         return r
 
     def market_sell(self, symbol, qty, price):
+        self.calls.append("market_sell")
         r = self._result("market_sell")
         if r["s"] == "error":
             return r
@@ -97,6 +112,8 @@ class LiveBrokerDouble:
         return []  # fills happen at the broker, not in-process (live semantics)
 
     def positions(self):
+        if self.positions_error:
+            raise RuntimeError("positions unavailable (network/timeout)")
         return [{"symbol": s, **p} for s, p in self.positions_map.items()
                 if p.get("qty", 0) != 0]
 

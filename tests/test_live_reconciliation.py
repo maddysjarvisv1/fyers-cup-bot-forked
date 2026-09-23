@@ -25,7 +25,9 @@ def _bot(double, state_path, price_map, watchlist=None, mode="LIVE", alerts=True
 # ---------------------------------------------------------------------------
 def test_live_reconcile_new_position_creates_pos_state_and_sell_stop(double, alert_log, tmp_path):
     double.positions_map["WINNER"] = {"qty": 100, "avg": 100.0}
-    bot = _bot(double, tmp_path, {"WINNER": 100.0})
+    # finding 5: reconcile only adopts strategy symbols (here WINNER is watchlisted)
+    bot = _bot(double, tmp_path, {"WINNER": 100.0},
+               watchlist=[{"symbol": "WINNER", "rim": 100, "trigger": 104, "qty": 100}])
 
     bot.cycle()
 
@@ -51,10 +53,17 @@ def test_live_reconcile_gone_position_cleans_up_no_phantom_sell_stop(double, ale
     bot = _bot(double, tmp_path, {})
     bot.pos_state["WINNER"] = {"state": _state(), "sell_stop_id": "L00001"}
 
-    bot.cycle()
+    bot.cycle()  # 1st absent cycle -> not yet confirmed (transient-empty guard)
+    assert "WINNER" in bot.pos_state
+    assert alert_log["exit_"] == []
+
+    double.pending.append({"id": "L00001", "symbol": "WINNER", "qty": 100,
+                           "trigger": 94.0, "side": "SELL", "status": "pending"})
+    bot.cycle()  # 2nd absent cycle -> confirmed gone
 
     assert "WINNER" not in bot.pos_state
     assert alert_log["exit_"], "expected EXIT alert on reconcile"
+    assert "L00001" in double.cancelled, "must cancel the orphaned sell-stop"
     # no phantom sell-stop must be placed for the gone position
     assert all(c[0] != "SELL" for c in double.placed)
 

@@ -41,15 +41,15 @@ def test_entry_pass_skips_symbol_in_pos_state(double, tmp_path):
     assert all(c[0] != "BUY" for c in double.placed)
 
 
-def test_entry_pass_skips_in_flight_symbol(double, tmp_path):
+def test_entry_pass_rearms_after_in_flight_order_cancelled(double, tmp_path):
     bot = _bot(double, tmp_path)
     prices = {"WINNER": 99.0}
 
     bot._entry_pass(prices)  # arms -> marks in-flight
     assert any(c[0] == "BUY" for c in double.placed)
 
-    # simulate a fill propagating: order leaves the orderbook, position not yet
-    # visible -> a second buy-stop must NOT be placed
+    # finding 8: the buy-stop is cancelled/rejected/expired at the broker (no
+    # open order, no position) -> _in_flight is cleared and the symbol re-arms.
     double.pending.clear()
     double.positions_map.clear()
     before = len([c for c in double.placed if c[0] == "BUY"])
@@ -57,4 +57,4 @@ def test_entry_pass_skips_in_flight_symbol(double, tmp_path):
     bot._entry_pass(prices)
 
     after = len([c for c in double.placed if c[0] == "BUY"])
-    assert after == before, "must not place a duplicate buy-stop while fill is in-flight"
+    assert after == before + 1, "must re-arm once the stale buy-stop is gone"

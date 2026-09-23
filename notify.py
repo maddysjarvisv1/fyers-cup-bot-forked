@@ -48,6 +48,9 @@ def exit_(mode, sym, price, qty, pnl):
     icon = "✅" if pnl >= 0 else "🔴"
     send(f"{icon} <b>[{mode}] EXIT {sym}</b>\n@ {price} × {qty}\nP&L {pnl:+.0f}")
 
+def error(mode, sym, msg):
+    send(f"🚨 <b>[{mode}] CRITICAL {sym}</b>\n{msg}")
+
 def report(mode, realized, wins, losses, open_positions):
     send(f"📊 <b>[{mode}] Session report</b>\nRealized P&L {realized:+.0f} | wins {wins} losses {losses}\n"
          f"Open positions: {len(open_positions)}")

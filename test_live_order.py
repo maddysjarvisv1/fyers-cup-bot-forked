@@ -62,7 +62,11 @@ def main():
     time.sleep(0.5)
 
     # 3) MODIFY — move the limit a bit lower (still won't fill)
-    show("MODIFY (limit -> 6% below)", c.modify_order(oid, limitPrice=round(ltp * 0.94, 1)))
+    # order_type=1 (LIMIT) is required here — modify_order()'s default (3,
+    # SL-M) is for the bot's own sell-stops and would send the wrong `type`
+    # for THIS order, which Fyers placed as a plain LIMIT order above.
+    show("MODIFY (limit -> 6% below)",
+         c.modify_order(oid, limit_price=round(ltp * 0.94, 1), order_type=1))
 
     time.sleep(1.5)
 

@@ -49,6 +49,30 @@ def plain(fyers_symbol: str) -> str:
     return s.rsplit("-", 1)[0] if "-" in s else s
 
 
+class FyersError(RuntimeError):
+    """Raised when Fyers returns s != 'ok' or an unusable payload."""
+
+
+def _ok(resp, what="request"):
+    """Validate a Fyers v3 response envelope. Returns resp or raises."""
+    if not isinstance(resp, dict):
+        raise FyersError(f"{what}: unexpected response {resp!r}")
+    if resp.get("s") != "ok":
+        raise FyersError(
+            f"{what} failed: code={resp.get('code')} msg={resp.get('message')} raw={resp}"
+        )
+    return resp
+
+
+def _order_id(resp, what="order"):
+    """Validate and extract the order id as a string."""
+    _ok(resp, what)
+    oid = resp.get("id") or (resp.get("data") or {}).get("id")
+    if not oid:
+        raise FyersError(f"{what}: no order id in response {resp}")
+    return str(oid)
+
+
 class FyersClient:
     def __init__(self, app_id: str, access_token: str, log_path="logs"):
         os.makedirs(log_path, exist_ok=True)
@@ -101,7 +125,8 @@ class FyersClient:
     # ---- order placement (REAL money — use deliberately) ----
     def place_buy_stop(self, symbol, qty, trigger, product="CNC", order_tag="cupbot"):
         """SL-M BUY (buy-stop). Fyers: type=3 (Stop/SL-M), side=1 (buy).
-        order_tag -> Fyers orderTag (strategy identifier; the Algo-ID hook)."""
+        order_tag -> Fyers orderTag (strategy identifier; the Algo-ID hook).
+        Returns the broker order id (string). Raises FyersError on rejection."""
         data = {
             "symbol": nse(symbol),
             "qty": int(qty),
@@ -114,20 +139,38 @@ class FyersClient:
             "offlineOrder": False,
             "orderTag": str(order_tag)[:20],
         }
-        return self.fy.place_order(data)
+        return _order_id(self.fy.place_order(data), f"buy-stop {symbol}")
 
     def place_sell_stop(self, symbol, qty, trigger, product="CNC", order_tag="cupbot"):
-        """SL-M SELL (stop-loss). type=3, side=-1."""
+        """SL-M SELL (stop-loss). type=3, side=-1. Returns order id (string)."""
         data = {
             "symbol": nse(symbol), "qty": int(qty), "type": 3, "side": -1,
             "productType": product, "limitPrice": 0, "stopPrice": float(trigger),
             "validity": "DAY", "offlineOrder": False, "orderTag": str(order_tag)[:20],
         }
-        return self.fy.place_order(data)
+        return _order_id(self.fy.place_order(data), f"sell-stop {symbol}")
 
-    def modify_order(self, order_id, **kwargs):
-        data = {"id": order_id, **kwargs}
-        return self.fy.modify_order(data)
+    def place_market_sell(self, symbol, qty, product="CNC", order_tag="cupbot"):
+        """Immediate market SELL (type=2). Used for partial booking and fallback exits."""
+        data = {
+            "symbol": nse(symbol), "qty": int(qty), "type": 2, "side": -1,
+            "productType": product, "limitPrice": 0, "stopPrice": 0,
+            "validity": "DAY", "offlineOrder": False, "orderTag": str(order_tag)[:20],
+        }
+        return _order_id(self.fy.place_order(data), f"market-sell {symbol}")
+
+    def modify_order(self, order_id, stop_price=None, limit_price=0, qty=None, order_type=3):
+        """Fyers v3 modify needs the order type alongside the id. For SL-M keep limitPrice 0."""
+        data = {"id": str(order_id), "type": int(order_type), "limitPrice": float(limit_price)}
+        if stop_price is not None:
+            data["stopPrice"] = float(stop_price)
+        if qty is not None:
+            data["qty"] = int(qty)
+        return _ok(self.fy.modify_order(data), f"modify {order_id}")
 
     def cancel_order(self, order_id):
-        return self.fy.cancel_order({"id": order_id})
+        """Cancel is best-effort: an already-traded/cancelled order is not an error for us."""
+        resp = self.fy.cancel_order({"id": str(order_id)})
+        if isinstance(resp, dict) and resp.get("s") != "ok":
+            print(f"[warn] cancel {order_id}: {resp.get('code')} {resp.get('message')}")
+        return resp

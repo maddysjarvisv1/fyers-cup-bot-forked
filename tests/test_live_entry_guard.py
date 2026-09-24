@@ -23,21 +23,21 @@ def test_entry_pass_skips_open_order(double, tmp_path):
     double.pending.append({"id": "X", "symbol": "WINNER", "qty": 100,
                            "trigger": 104, "side": "BUY", "status": "pending"})
     bot = _bot(double, tmp_path)
-    bot._entry_pass({"WINNER": 99.0})
+    bot._entry_pass_isolated({"WINNER": 99.0})
     assert all(c[0] != "BUY" for c in double.placed)
 
 
 def test_entry_pass_skips_existing_position(double, tmp_path):
     double.positions_map["WINNER"] = {"qty": 100, "avg": 100.0}
     bot = _bot(double, tmp_path)
-    bot._entry_pass({"WINNER": 99.0})
+    bot._entry_pass_isolated({"WINNER": 99.0})
     assert all(c[0] != "BUY" for c in double.placed)
 
 
 def test_entry_pass_skips_symbol_in_pos_state(double, tmp_path):
     bot = _bot(double, tmp_path)
     bot.pos_state["WINNER"] = {"state": _state(), "sell_stop_id": "L00001"}
-    bot._entry_pass({"WINNER": 99.0})
+    bot._entry_pass_isolated({"WINNER": 99.0})
     assert all(c[0] != "BUY" for c in double.placed)
 
 
@@ -45,7 +45,7 @@ def test_entry_pass_rearms_after_in_flight_order_cancelled(double, tmp_path):
     bot = _bot(double, tmp_path)
     prices = {"WINNER": 99.0}
 
-    bot._entry_pass(prices)  # arms -> marks in-flight
+    bot._entry_pass_isolated(prices)  # arms -> marks in-flight
     assert any(c[0] == "BUY" for c in double.placed)
 
     # finding 8: the buy-stop is cancelled/rejected/expired at the broker (no
@@ -54,7 +54,7 @@ def test_entry_pass_rearms_after_in_flight_order_cancelled(double, tmp_path):
     double.positions_map.clear()
     before = len([c for c in double.placed if c[0] == "BUY"])
 
-    bot._entry_pass(prices)
+    bot._entry_pass_isolated(prices)
 
     after = len([c for c in double.placed if c[0] == "BUY"])
     assert after == before + 1, "must re-arm once the stale buy-stop is gone"

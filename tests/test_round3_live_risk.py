@@ -1,16 +1,28 @@
 """Round-3 live-risk fixes: R3-1..R3-4 from the round-2 reviewer report.
 
 Each test maps to a specific remaining money-exposure finding:
-  R3-1  _reconcile_qty must cancel the old stop before re-placing (no stacking).
+  R3-1  qty-drift reconcile must not stack a second stop on the old one.
   R3-2  an entry-side failure must not starve exit management / the self-heal.
   R3-3  a failed orphan-stop cancel during gone-cleanup must not be swallowed.
   R3-4  None from a LIVE mutator is a failure (not success).
 
 Mocks only (LiveBrokerDouble from conftest). No network, no real orders.
-"""
-import pytest
 
-from bot import CupBot, LiveOrderError, _extract_order_id, _request_ok
+=== MERGE NOTE ===
+R3-1 and R3-4 are adapted for the merged design (see test_round2_live_risk.py's
+merge note for why): the "cancel before replace" ordering is now the fallback
+path of broker.modify_stop_qty, exercised here by forcing
+double.fail["modify_stop_qty"]; the atomic (no-cancel-needed) path is the
+default and is covered in test_round2_live_risk.py.
+
+R3-4's original test expected modify_stop/cancel/market_sell failures to RAISE
+OUT of cycle(). The merged bot.py deliberately catches these inside
+_exit_pass and alerts instead (see test_live_failure.py's merge note) so one
+symbol's broken mutator can't abort exit management for every other symbol in
+the same cycle. What R3-4 actually protects — a None result must never be
+silently treated as success — is unchanged and is what these tests verify.
+"""
+from bot import CupBot, LiveOrderError, _mutator_ok, _cancel_ok
 from conftest import WL
 
 
@@ -34,19 +46,20 @@ def _bot(double, state_path, price_map, watchlist=None, mode="LIVE", alerts=True
 
 
 # ---------------------------------------------------------------------------
-# R3-1 (CRITICAL, NEW-1): qty-drift reconcile must cancel the old stop first
+# R3-1 (CRITICAL, NEW-1): qty-drift reconcile must never stack a second stop
 # ---------------------------------------------------------------------------
-def test_reconcile_qty_cancels_old_stop_before_replacing(double, tmp_path):
+def test_reconcile_qty_fallback_cancels_old_stop_before_replacing(double, tmp_path):
     double.positions_map["WINNER"] = {"qty": 40, "avg": 100.0}
     bot = _bot(double, tmp_path, {"WINNER": 100.0}, alerts=False)
 
     bot.cycle()  # adopt the 40-share partial fill
     old_id = bot.pos_state["WINNER"]["sell_stop_id"]
     assert old_id
-    assert double.placed[-1] == ("SELL", "WINNER", 40, 94.0)
 
-    # later fills bring the broker position to 100 -> qty drift
+    # later fills bring the broker position to 100 -> qty drift; force the
+    # cancel-then-replace fallback so this test actually exercises a cancel
     double.positions_map["WINNER"] = {"qty": 100, "avg": 100.0}
+    double.fail["modify_stop_qty"] = True
     double.placed.clear()
 
     bot.cycle()
@@ -65,7 +78,8 @@ def test_reconcile_qty_cancel_failure_does_not_stack_and_alerts(double, alert_lo
 
     bot.cycle()  # adopt at 40
     old_id = bot.pos_state["WINNER"]["sell_stop_id"]
-    double.fail["cancel"] = "always"
+    double.fail["modify_stop_qty"] = True   # force the fallback...
+    double.fail["cancel"] = "always"        # ...and make its cancel fail too
     double.placed.clear()
 
     bot._reconcile_qty("WINNER", {"qty": 100, "avg": 100.0})
@@ -141,56 +155,61 @@ def test_cancel_failure_orphan_retried_next_cycle(double, alert_log, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# R3-4 (finding #7): None from a LIVE mutator is a FAILURE
+# R3-4 (finding #7): None from a LIVE mutator is a FAILURE, not success
 # ---------------------------------------------------------------------------
-def test_live_mutator_none_is_failure(double, tmp_path):
-    # mode-aware semantics: None is success only outside LIVE (paper regression)
-    assert _request_ok(None) is True
-    assert _request_ok(None, "PAPER") is True
-    assert _request_ok(None, "LIVE") is False
+def test_mutator_ok_and_cancel_ok_are_mode_aware():
+    # PaperBroker mutators return None on success -> True outside LIVE
+    assert _mutator_ok(None, "PAPER") is True
+    assert _cancel_ok(None, "PAPER") is True
+    # a real LiveBroker mutator always returns a dict or raises; a bare None
+    # in LIVE means a swallowed exception, and must be treated as a failure
+    assert _mutator_ok(None, "LIVE") is False
+    assert _cancel_ok(None, "LIVE") is False
+    # dict results: only s == "ok" (case-insensitive) counts as success
+    assert _mutator_ok({"s": "ok"}, "LIVE") is True
+    assert _mutator_ok({"s": "OK"}, "LIVE") is True
+    assert _mutator_ok({"s": "error"}, "LIVE") is False
+    assert _mutator_ok({}, "LIVE") is False
+    # cancel additionally tolerates an "already gone" style message
+    assert _cancel_ok({"s": "error", "message": "order not found"}, "LIVE") is True
+    assert _cancel_ok({"s": "error", "message": "insufficient margin"}, "LIVE") is False
 
-    # a LIVE place_* error dict carrying an id must never yield a stored id
-    assert _extract_order_id({"s": "error", "id": "X"}) is None
-    assert _extract_order_id({"s": "ok", "id": "X"}) == "X"
 
+def test_modify_stop_none_result_alerts_and_marks_stop_missing(double, alert_log, tmp_path):
     class NoneModifyDouble(double.__class__):
         def modify_stop(self, order_id, new_trigger):
             self.calls.append("modify_stop")
-            return None
+            return None   # simulates a swallowed exception somewhere below us
 
-    class NoneCancelDouble(double.__class__):
-        def cancel(self, order_id):
-            self.calls.append("cancel")
-            return None
-
-    class NoneSellDouble(double.__class__):
-        def market_sell(self, symbol, qty, price):
-            self.calls.append("market_sell")
-            return None
-
-    # modify_stop -> None is a failure (breakeven/trail path)
     d = NoneModifyDouble()
     d.positions_map["WINNER"] = {"qty": 100, "avg": 100.0}
     bot = _bot(d, tmp_path, {"WINNER": 111.0})
     bot.pos_state["WINNER"] = {"state": _state(phase="ACTIVE", sl=94.0, highest=100.0),
                                "sell_stop_id": "L00001"}
-    with pytest.raises(LiveOrderError, match="modify_stop"):
-        bot.cycle()
 
-    # cancel -> None is a failure (partial-book path)
-    d = NoneCancelDouble()
-    d.positions_map["WINNER"] = {"qty": 100, "avg": 100.0}
-    bot = _bot(d, tmp_path, {"WINNER": 120.0})
-    bot.pos_state["WINNER"] = {"state": _state(phase="BE", sl=100.0, highest=110.0),
-                               "sell_stop_id": "L00001"}
-    with pytest.raises(LiveOrderError, match="cancel"):
-        bot.cycle()
+    bot.cycle()   # must not raise; must not treat None as success
 
-    # market_sell -> None is a failure (partial-book path, after a good cancel)
+    assert bot.pos_state["WINNER"]["sell_stop_id"] is None, \
+        "a None modify_stop result in LIVE must mark the stop missing, not leave it as-is"
+    assert any("SL MODIFY FAILED" in a[2] for a in alert_log["error"])
+
+
+def test_market_sell_none_result_in_fallback_exit_alerts(double, alert_log, tmp_path):
+    class NoneSellDouble(double.__class__):
+        def market_sell(self, symbol, qty, price, order_tag=None):
+            self.calls.append("market_sell")
+            return None
+
     d = NoneSellDouble()
     d.positions_map["WINNER"] = {"qty": 100, "avg": 100.0}
-    bot = _bot(d, tmp_path, {"WINNER": 120.0})
-    bot.pos_state["WINNER"] = {"state": _state(phase="BE", sl=100.0, highest=110.0),
-                               "sell_stop_id": "L00001"}
-    with pytest.raises(LiveOrderError, match="market_sell"):
-        bot.cycle()
+    bot = _bot(d, tmp_path, {"WINNER": 90.0})   # below the -6% stop (97.76)
+    # sell_stop_id is set (so the self-heal doesn't fire) but nothing matching
+    # rests in open_orders() (so _has_live_stop is False) — simulates the stop
+    # having already been consumed/expired without the bot yet knowing.
+    bot.pos_state["WINNER"] = {"state": _state(sl=97.76), "sell_stop_id": "GONE"}
+
+    bot.cycle()   # no resting stop -> fallback market-sell path; must not raise
+
+    assert "WINNER" in bot.pos_state, \
+        "a None (failed) fallback sell must not be treated as a completed exit"
+    assert any("EXIT FAILED" in a[2] for a in alert_log["error"])

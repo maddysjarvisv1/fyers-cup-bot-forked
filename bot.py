@@ -6,39 +6,76 @@ knows which — it just calls the broker interface.
 
 Run the built-in scripted demo (proves the full lifecycle + report, no market needed):
     python bot.py
+
+=== MERGE NOTE (see docs/LIVE_MODE_DESIGN.md for the full write-up) ===
+This file merges two independent fix efforts:
+  1. broker.py / fyers_client.py fixes: real order-id validation, a working
+     modify_order payload, IST timestamps + day-roll, orderbook caching.
+  2. This file's reconciliation/crash-safety logic: originally written against
+     the UNFIXED broker layer (github.com/.../fix/live-risk-flash-test), which
+     is why it never trusted feed() and did everything via positions()-diffing.
+Both halves are needed; neither alone is live-safe. See the design doc for why.
 """
 import json
 import os
 from dataclasses import asdict
+from datetime import datetime, timezone, timedelta
 import cup_sl_engine as sl
 from broker import PaperBroker
 
 NEAR_PCT = 0.01   # arm a buy-stop only within 1% of the rim
+IST = timezone(timedelta(hours=5, minutes=30))   # India has no DST
 
-# === FIX(live-risk): number of consecutive cycles a position must be absent
-# from positions() before it is treated as truly gone (guards against a
-# transient empty snapshot from an API hiccup wiping state / faking an exit).
+# Number of consecutive cycles a position must be absent from positions()
+# before it is treated as truly gone (guards against a transient empty
+# snapshot from an API hiccup wiping state / faking an exit).
 GONE_CONFIRM_CYCLES = 2
+
+
+def _today():
+    return datetime.now(IST).strftime("%Y-%m-%d")
 
 
 def log(msg):
     print(msg, flush=True)
 
 
-# === FIX(live-risk): a live order op failed — surface it so the runner raises,
-# rather than silently continuing with a stale/missing stop-loss.
 class LiveOrderError(Exception):
-    """Raised when a live broker order operation fails."""
+    """Raised when a live broker order operation fails outright (not the
+    tolerable "already filled / not found" shape cancel() can return)."""
 
 
-# === FIX(live-risk): strict success check for mutators (modify/cancel/sell).
-# === FIX(live-risk): R3-4 — None is success ONLY outside LIVE. PaperBroker
-# mutators return None; a LiveBroker mutator returns a Fyers dict, so a None
-# there means a swallowed exception and MUST be treated as a failure (otherwise
-# a stale SL / orphan stop is counted as corrected). In LIVE a dict must carry
-# s == "ok" (case-insensitive); a missing/error "s" is a failure.
-def _request_ok(result, mode=None):
-    """True when a mutator result indicates success."""
+# --- cancel-result classification -------------------------------------------
+# cancel() is deliberately best-effort at the fyers_client layer (it never
+# raises — see fyers_client.cancel_order): a cancel racing against the order
+# having just filled, or against it already being gone, is not our failure.
+# Anything else must NOT be silently dropped, or a still-resting SELL-stop is
+# forgotten and a later trigger turns it into an accidental short.
+_CANCEL_TOLERABLE_MARKERS = (
+    "not found", "no such", "does not exist", "not open",
+    "already", "filled", "completed", "cancelled", "canceled",
+)
+
+
+def _cancel_ok(result, mode=None):
+    if isinstance(result, dict):
+        if str(result.get("s", "")).lower() == "ok":
+            return True
+        msg = str(result.get("message", "")).lower()
+        return any(m in msg for m in _CANCEL_TOLERABLE_MARKERS)
+    if result is None:
+        # PaperBroker.cancel() returns None on success. A real LiveBroker
+        # mutator always returns a dict or raises (see broker.py) — a None
+        # in LIVE means an exception was swallowed somewhere and must be
+        # treated as a failure, not silently accepted.
+        return mode != "LIVE"
+    return bool(result)
+
+
+def _mutator_ok(result, mode):
+    """True if a non-cancel mutator (modify_stop / market_sell / the atomic
+    path of modify_stop_qty) succeeded. Same None-is-LIVE-failure reasoning
+    as _cancel_ok above."""
     if result is None:
         return mode != "LIVE"
     if isinstance(result, dict):
@@ -46,46 +83,11 @@ def _request_ok(result, mode=None):
     return bool(result)
 
 
-# === FIX(live-risk): R3-3 — a cancel is only "effectively OK" on success or an
-# explicit already-filled / not-found / not-open condition. Anything else must
-# NOT be silently dropped, or a still-resting SELL-stop is forgotten and a later
-# trigger turns it into a short.
-_CANCEL_TOLERABLE_MARKERS = (
-    "not found", "no such", "does not exist", "not open",
-    "already", "filled", "completed", "cancelled", "canceled",
-)
-
-
-def _cancel_tolerable(result, mode=None):
-    """True when a cancel result may be treated as the stop being gone."""
-    if _request_ok(result, mode):
-        return True
-    if isinstance(result, dict):
-        msg = str(result.get("message", "")).lower()
-        return any(m in msg for m in _CANCEL_TOLERABLE_MARKERS)
-    return False
-
-
-# === FIX(live-risk): normalize a place_* result to a bare order-id string.
-# A LIVE place_* must yield a non-empty id; if the broker returns a dict
-# carrying "id", extract it (so sell_stop_id is never a whole dict). Returns
-# None when no valid id is present (swallowed exception / error dict / empty).
-def _extract_order_id(result):
-    if isinstance(result, dict):
-        # === FIX(live-risk): R3-4 — an explicit error dict must never yield an
-        # id (a failed place_* must not be stored as sell_stop_id).
-        if str(result.get("s", "")).lower() not in ("", "ok"):
-            return None
-        result = result.get("id")
-    if isinstance(result, str) and result.strip():
-        return result.strip()
-    return None
-
-
 class CupBot:
     def __init__(self, broker, price_source, watchlist, state_path="bot_state.json",
                  near_pct=NEAR_PCT, verbose=True, mode="PAPER", alerts=False, tag="cup",
-                 gone_confirm_cycles=GONE_CONFIRM_CYCLES):
+                 max_positions=0, gone_confirm_cycles=GONE_CONFIRM_CYCLES,
+                 adopt_watchlist_only=True):
         self.broker = broker
         self.tag = tag                       # order tag / Algo-ID identifier
         self.price_source = price_source     # callable(symbols)->{SYM: ltp}
@@ -95,38 +97,61 @@ class CupBot:
         self.verbose = verbose
         self.mode = mode                     # "PAPER" | "LIVE" (for alert tags)
         self.alerts = alerts                 # send Telegram alerts?
+        self.max_positions = int(max_positions or 0)      # 0 = unlimited
         self.gone_confirm_cycles = gone_confirm_cycles
+        # Only ever adopt/protect positions whose symbol is on the watchlist (or
+        # already ours), so the bot cannot slap a stop on stock bought by hand
+        # in the same account.
+        self.adopt_watchlist_only = bool(adopt_watchlist_only)
         self.pos_state = {}                  # SYM -> {"state": {...}, "sell_stop_id": id}
-        # === FIX(live-risk): track symbols whose entry buy-stop was placed this
-        # session but whose fill has not yet produced a position (in-flight).
-        # NOTE: intentionally NOT persisted — each cycle it is reconciled from
-        # open_orders()/positions(); a stale entry is cleared below (_entry_pass).
+        # Symbols whose entry buy-stop was placed this session but whose fill
+        # has not yet produced a position. Intentionally NOT persisted — each
+        # cycle it is reconciled from open_orders()/positions().
         self._in_flight = set()
-        # === FIX(live-risk): consecutive cycles each pos_state symbol has been
-        # absent from positions(); in-memory only (restart re-confirms, safe).
+        # Consecutive cycles each pos_state symbol has been absent from
+        # positions(); in-memory only (a restart re-confirms, which is safe).
         self._gone_since = {}
-        # === FIX(live-risk): R3-3 — orphan stop ids whose cancel could not be
-        # confirmed (sym -> order_id). Retained and retried; never silently
-        # forgotten (a resting SELL-stop would open a short on a later trigger).
+        # Orphan stop ids whose cancel could not be confirmed (sym -> order_id).
+        # Retained and retried; never silently forgotten.
         self._orphan_stops = {}
+        self._warned_foreign = set()
+        self.day = _today()
         if os.path.exists(state_path):
-            self.pos_state = json.load(open(state_path))
+            blob = json.load(open(state_path))
+            self.day = blob.pop("_day", self.day)
+            self.pos_state = blob
+        if self.day != _today():
+            # DAY-validity stops died at the close. Forget the ids; the exit-pass
+            # self-heal (and, in LIVE, _reconcile_live) re-places them.
+            for ps in self.pos_state.values():
+                ps["sell_stop_id"] = None
+            self.day = _today()
+            log("  new trading day — stored stop ids cleared, stops will be re-placed")
+
+    def _watch_syms(self):
+        return {w["symbol"].upper() for w in self.watchlist}
+
+    def _managed(self):
+        """Symbols this bot may adopt/protect: the watchlist, anything with a
+        buy-stop in flight, and anything already tracked. Everything else —
+        stock bought by hand in the same account — is left alone."""
+        if not self.adopt_watchlist_only:
+            return None   # sentinel: caller should treat every symbol as managed
+        return self._watch_syms() | set(self._in_flight) | set(self.pos_state)
 
     def _alert(self, fn, *a, **k):
-        if self.alerts:
-            import notify
-            getattr(notify, fn)(self.mode, *a, **k)
+        if not self.alerts:
+            return
+        import notify
+        if fn == "send":
+            notify.send(*a, **k)
+            return
+        getattr(notify, fn)(self.mode, *a, **k)
 
     def _save(self):
-        json.dump(self.pos_state, open(self.state_path, "w"), indent=2)
-
-    # === FIX(live-risk): verify a live broker op result and raise on failure so
-    # the runner surfaces it instead of continuing with a stale SL.
-    def _check_live(self, result, op, sym):
-        # === FIX(live-risk): R3-4 — pass mode so a None mutator result fails in
-        # LIVE (swallowed exception) but still succeeds in PAPER.
-        if self.mode == "LIVE" and not _request_ok(result, self.mode):
-            raise LiveOrderError(f"LIVE {op} failed for {sym}: {result!r}")
+        blob = dict(self.pos_state)
+        blob["_day"] = self.day
+        json.dump(blob, open(self.state_path, "w"), indent=2)
 
     def _syms(self):
         s = {w["symbol"] for w in self.watchlist}
@@ -134,51 +159,52 @@ class CupBot:
         return list(s)
 
     def cycle(self):
-        # === FIX(live-risk): always persist state (try/finally) so a live op
-        # that raises mid-cycle still writes out any earlier successful mutations
-        # (prevents duplicate/partial re-booking after a restart).
+        # Always persist (try/finally), so a live op that raises mid-cycle still
+        # writes out any earlier successful mutation this cycle (prevents a
+        # restart from duplicating or re-booking work already done).
         try:
             prices = self.price_source(self._syms())
-            fills = self.broker.feed(prices)          # paper: process resting stops
+            fills = self.broker.feed(prices)          # accurate fill price, tag-based
             self._on_fills(fills)
-            self._reconcile_live()
-            # === FIX(live-risk): R3-2 — run exit management + the self-heal
-            # BEFORE entry, so a later entry-side failure can never starve exit
-            # protection for an already-naked position.
+            self._reconcile_live()                    # LIVE-only safety net (see broker.py)
+            # Exit management (+ self-heal) runs BEFORE entry, so a later
+            # entry-side failure can never starve exit protection for an
+            # already-open position.
             self._exit_pass(prices)
-            # === FIX(live-risk): R3-2 — entry is isolated per symbol: a rejected
-            # buy-stop or broker error alerts and is skipped, it does not abort
-            # the cycle after exits have run.
+            # Entry is isolated per symbol: a rejected buy-stop or broker error
+            # alerts and is skipped, it does not abort the cycle after exits
+            # have already run.
             self._entry_pass_isolated(prices)
             return prices, fills
         finally:
             self._save()
 
-    # === FIX(live-risk): place + verify a sell-stop; returns a normalized id.
-    # In LIVE the broker must yield a non-empty id (or a dict with "id"); a None
-    # result (swallowed exception) or error is a failure.
+    # -- verified order placement: raises LiveOrderError on a confirmed failure.
+    # fyers_client.py already raises FyersError on a rejected place_* and never
+    # returns a falsy id — but a falsy id in LIVE with no exception (a swallowed
+    # error somewhere in a broker double, or a future regression) must not be
+    # silently accepted as success either, so it's checked explicitly here too.
     def _place_sell(self, sym, qty, trigger):
-        result = self.broker.place_sell_stop(sym, qty, trigger, order_tag=self.tag)
-        oid = _extract_order_id(result)
-        if oid is None and self.mode == "LIVE":
-            raise LiveOrderError(f"LIVE place_sell_stop returned no order id for {sym}: {result!r}")
-        return oid
+        try:
+            sid = self.broker.place_sell_stop(sym, qty, trigger, order_tag=self.tag)
+        except Exception as e:
+            raise LiveOrderError(f"place_sell_stop failed for {sym}: {e}") from e
+        if not sid and self.mode == "LIVE":
+            raise LiveOrderError(f"place_sell_stop for {sym} returned no order id")
+        return sid
 
-    # === FIX(live-risk): place + verify a buy-stop; same id normalization.
     def _place_buy(self, sym, qty, trigger):
-        result = self.broker.place_buy_stop(sym, qty, trigger, order_tag=self.tag)
-        oid = _extract_order_id(result)
-        if oid is None and self.mode == "LIVE":
-            raise LiveOrderError(f"LIVE place_buy_stop returned no order id for {sym}: {result!r}")
-        return oid
+        try:
+            sid = self.broker.place_buy_stop(sym, qty, trigger, order_tag=self.tag)
+        except Exception as e:
+            raise LiveOrderError(f"place_buy_stop failed for {sym}: {e}") from e
+        if not sid and self.mode == "LIVE":
+            raise LiveOrderError(f"place_buy_stop for {sym} returned no order id")
+        return sid
 
-    # === FIX(live-risk): best-effort cancel used by cleanup; returns True only
-    # when the stop is confirmed gone. "already filled / not found / not open"
-    # is tolerable and must not raise.
-    # === FIX(live-risk): R3-3 — a hard failure or exception is NOT swallowed:
-    # the orphan id is retained in _orphan_stops and a CRITICAL alert fires, so
-    # the caller can keep the position and retry instead of forgetting a resting
-    # SELL-stop (which would open a short on a later trigger).
+    # -- best-effort cancel; True only when the stop is confirmed gone. A hard
+    # failure is retained in _orphan_stops and alerted, never silently dropped
+    # (a still-resting SELL-stop would open a short on a later trigger) --
     def _cancel_tolerant(self, order_id, sym):
         if not order_id:
             return True
@@ -186,7 +212,7 @@ class CupBot:
             res = self.broker.cancel(order_id)
         except Exception as e:
             res = e
-        if _cancel_tolerable(res, self.mode):
+        if _cancel_ok(res, self.mode):
             self._orphan_stops.pop(sym, None)
             return True
         self._orphan_stops[sym] = order_id
@@ -195,74 +221,93 @@ class CupBot:
         self._alert("error", sym, f"cancel failed for orphan stop {order_id}: {res!r}")
         return False
 
-    # === FIX(live-risk): reconcile live positions with local pos_state, since
-    # LiveBroker.feed() returns [] and _on_fills never fires in live mode.
+    def _mutate(self, fn, *a, **k):
+        """Call a non-cancel mutator (modify_stop / market_sell / modify_stop_qty)
+        and raise if its result doesn't indicate success — including a bare
+        None in LIVE mode, which real broker.py never returns on success (see
+        _mutator_ok): a swallowed exception must not be mistaken for success."""
+        res = fn(*a, **k)
+        if not _mutator_ok(res, self.mode):
+            raise LiveOrderError(f"{fn.__name__} returned {res!r}")
+        return res
+
+    def _has_live_stop(self, sym):
+        for o in self.broker.open_orders(sym):
+            if o.get("side") == "SELL":
+                return True
+        return False
+
+    # === LIVE-only safety net ================================================
+    # broker.feed() is the primary source of ENTRY/STOP_EXIT events (accurate
+    # fill price, from the orderbook). This is the secondary net: it diffs
+    # positions() against pos_state every cycle, so a fill feed() missed (a tag
+    # Fyers didn't echo, an orderbook row that aged out before we polled) is
+    # still caught — a new position gets a stop, a position that's genuinely
+    # gone gets cleaned up. It is also what makes it safe to persist an
+    # SL-engine mutation before its broker call is confirmed (see _exit_pass):
+    # any resulting drift between local qty_remaining and the broker's actual
+    # qty is corrected here on the very next cycle.
     def _reconcile_live(self):
         if self.mode != "LIVE":
             return
-        # === FIX(live-risk): a failed/exceptional positions() snapshot is an
-        # ERROR, not an empty list — never wipe state or fire a fake EXIT on a
-        # network/timeout failure.
         try:
             positions = self.broker.positions()
         except Exception as e:
+            # A failed snapshot is an ERROR, not an empty list — never wipe
+            # state or fire a fake EXIT on a network/timeout failure.
             if self.verbose:
                 log(f"  LIVE positions() failed: {e} — skipping reconcile cleanup")
             self._alert("error", "ALL", f"positions() failed: {e}")
             return
-        # positions() already returns only filled net positions, so a symbol that
-        # is merely a just-placed-pending buy order (no fill yet) is absent here.
         pos_by_sym = {p["symbol"]: p for p in positions}
 
-        # === FIX(live-risk): only manage strategy symbols (watchlist, in-flight,
-        # or already-tracked) — never adopt foreign/manual/holding positions.
-        managed = {w["symbol"] for w in self.watchlist} | set(self._in_flight) | set(self.pos_state)
+        managed = self._managed()   # None => everything managed (guard disabled)
 
         # NEW POSITION -> ENTRY: create PosState + place the protective sell-stop
         for sym, p in pos_by_sym.items():
-            if sym not in managed:
-                continue  # foreign/manual position (not this strategy) — leave it alone
+            if managed is not None and sym not in managed:
+                if sym not in self._warned_foreign:
+                    self._warned_foreign.add(sym)
+                    log(f"  SKIP  {sym}: position not on the watchlist and not opened "
+                        f"by this bot — left alone (no stop placed)")
+                continue
             if sym in self.pos_state:
-                self._reconcile_qty(sym, p)  # partial-fill qty drift (below)
-                continue  # already managed (no duplicate SELL-stop)
+                self._reconcile_qty(sym, p)   # partial-fill / drift resync
+                continue
             st = sl.PosState(entry=p["avg"], qty_total=p["qty"], qty_remaining=p["qty"])
-            sid = self._place_sell(sym, p["qty"], st.sl)
+            try:
+                sid = self._place_sell(sym, p["qty"], st.sl)
+            except LiveOrderError as e:
+                log(f"  ERROR {sym}: could not place protective stop: {e}")
+                self._alert("error", sym, f"STOP PLACEMENT FAILED: {e}")
+                continue
             self.pos_state[sym] = {"state": asdict(st), "sell_stop_id": sid}
             self._in_flight.discard(sym)
-            # === FIX(live-risk): persist immediately after this broker mutation,
-            # so a later failure in this loop can't lose it (finding 1).
-            self._save()
+            self._save()   # persist immediately — a later failure in this loop can't lose it
             if self.verbose:
-                log(f"  ENTRY {sym} reconciled @ {p['avg']} x{p['qty']} -> initial SL {st.sl} (sell-stop {sid})")
+                log(f"  ENTRY {sym} reconciled @ {p['avg']} x{p['qty']} -> initial SL {st.sl} (stop {sid})")
             self._alert("entry", sym, p["avg"], p["qty"], st.sl)
 
-        # POSITION GONE -> STOP_EXIT cleanup (do NOT create a phantom sell-stop)
+        # POSITION GONE -> cleanup (never create a phantom sell-stop for it)
         for sym in list(self.pos_state):
             ps = self.pos_state.get(sym)
             if not ps:
                 continue
             st = ps.get("state") or {}
             if st.get("qty_remaining", 0) <= 0 or sym in pos_by_sym:
-                # still held (or already fully booked) — reset the absence counter
                 self._gone_since[sym] = 0
                 continue
-            # === FIX(live-risk): require absence across GONE_CONFIRM_CYCLES, and
-            # cancel the orphaned sell-stop before dropping the position, so a
-            # transient empty snapshot can't wipe state or leak a short.
+            # Require absence across gone_confirm_cycles: a transient empty
+            # snapshot must not wipe state or fire a fake EXIT.
             cnt = self._gone_since.get(sym, 0) + 1
             self._gone_since[sym] = cnt
             if cnt < self.gone_confirm_cycles:
-                continue  # not yet confirmed gone
-            # === FIX(live-risk): R3-3 — cancel the orphan stop FIRST and only
-            # forget the position once that stop is confirmed gone (or an
-            # already-filled/not-found cancel). A failed cancel is retained (and
-            # retried next cycle) instead of silently dropping a resting stop.
+                continue
             order_id = ps.get("sell_stop_id") or self._orphan_stops.get(sym)
             if order_id and not self._cancel_tolerant(order_id, sym):
                 ps["sell_stop_id"] = order_id
-                ps["_need_cancel"] = True
                 self._save()
-                continue  # keep the position; do NOT fire a fake EXIT
+                continue   # keep the position; do NOT fire a fake EXIT
             entry = st.get("entry", 0.0)
             qty = st.get("qty_remaining", st.get("qty_total", 0))
             exit_px = st.get("sl", entry)
@@ -275,103 +320,86 @@ class CupBot:
             self._gone_since.pop(sym, None)
             self._save()
 
-    # === FIX(live-risk): repair partial-fill qty drift — if the broker's net
-    # position qty no longer matches qty_remaining, re-sync and re-place the
-    # protective stop at the correct qty (60 of 100 shares were unprotected).
-    # === FIX(live-risk): R3-1 — cancel the OLD stop BEFORE placing the new one.
-    # Never leave two SELL-stops resting (40-lot + 100-lot = 140 sold against
-    # 100 held -> oversell/short). On a failed cancel do NOT stack: retain the
-    # orphan and leave sell_stop_id None so the self-heal owns re-placement.
     def _reconcile_qty(self, sym, p):
+        """Repair partial-fill / drift: if the broker's net qty no longer
+        matches qty_remaining, resync and re-protect at the correct qty.
+        Never stack a second stop on the old one — shrink/replace via
+        modify_stop_qty (atomic-with-fallback; see broker.py), which itself
+        refuses to place a second stop if a cancel can't be confirmed."""
         ps = self.pos_state.get(sym)
         if not ps:
             return
         st = sl.PosState(**ps["state"])
         if p["qty"] == st.qty_remaining:
             return
+        old_qty = st.qty_remaining
         st.qty_remaining = int(p["qty"])
         if st.qty_remaining > st.qty_total:
             st.qty_total = st.qty_remaining
-        # persist the resynced qty first, so a failure below cannot lose it
         ps["state"] = asdict(st)
-        self._save()
+        self._save()   # resynced qty persisted first — a failure below can't lose it
         old_id = ps.get("sell_stop_id")
-        if old_id:
-            try:
-                res = self.broker.cancel(old_id)
-            except Exception as e:
-                res = e
-            if not _cancel_tolerable(res, self.mode):
-                # === FIX(live-risk): R3-1 — cancel failed: do NOT place a second
-                # stop. Keep the orphan for retry and leave the SL missing so the
-                # exit-pass self-heal can finish the job; alert CRITICAL.
-                self._orphan_stops[sym] = old_id
-                ps["sell_stop_id"] = None
-                ps["_need_cancel"] = old_id
-                self._save()
-                if self.verbose:
-                    log(f"  SYNC  {sym} qty drift -> {st.qty_remaining}: cancel {old_id} failed "
-                        f"({res!r}) — deferring stop re-place")
-                self._alert("error", sym, f"qty-drift cancel failed for {old_id}: {res!r}")
-                return
+        if not old_id:
+            # no resting stop to resize — the exit-pass self-heal will place one
+            if self.verbose:
+                log(f"  SYNC  {sym} qty drift {old_qty}->{st.qty_remaining}: no stop to resize")
+            return
+        try:
+            res = self._mutate(self.broker.modify_stop_qty, old_id, st.qty_remaining, st.sl,
+                                symbol=sym, order_tag=self.tag)
+        except Exception as e:
+            self._orphan_stops[sym] = old_id
             ps["sell_stop_id"] = None
             self._save()
-        sid = self._place_sell(sym, st.qty_remaining, st.sl)
-        ps["sell_stop_id"] = sid
-        ps.pop("_need_cancel", None)
+            log(f"  SYNC  {sym} qty drift -> {st.qty_remaining}: stop resize failed ({e}) "
+                f"— deferring to self-heal")
+            self._alert("error", sym, f"qty-drift stop resize failed: {e}")
+            return
+        if isinstance(res, dict) and res.get("id"):
+            ps["sell_stop_id"] = str(res["id"])
         self._orphan_stops.pop(sym, None)
-        self._in_flight.discard(sym)
         self._save()
         if self.verbose:
-            log(f"  SYNC  {sym} qty drift -> {st.qty_remaining} (sell-stop {sid})")
+            log(f"  SYNC  {sym} qty drift -> {st.qty_remaining} (stop {ps['sell_stop_id']})")
 
-    # -- entry: arm buy-stop only for near-rim, uncrossed, not-already-handled --
-    # === FIX(live-risk): R3-2 — gather held/pending symbols; raises on a broker
-    # query error so the caller can isolate it.
+    # -- entry -----------------------------------------------------------------
     def _entry_have(self):
         have = {p["symbol"] for p in self.broker.positions()}
         have |= {o["symbol"] for o in self.broker.open_orders()}
-        # === FIX(live-risk): _in_flight is intentionally NOT persisted; clear
-        # any symbol whose buy-stop is no longer an open order AND produced no
-        # position (it was cancelled/rejected/expired) so it can re-arm.
+        # _in_flight is intentionally not persisted; clear any symbol whose
+        # buy-stop is no longer an open order AND produced no position (it was
+        # cancelled/rejected/expired) so it can re-arm.
         for sym in list(self._in_flight):
             if sym not in have:
                 self._in_flight.discard(sym)
         return have
 
-    # === FIX(live-risk): R3-2 — entry for a single watchlist symbol; raises on
-    # failure (callers decide whether to isolate).
     def _entry_one(self, w, have, prices):
         sym, rim, trig, qty = w["symbol"], float(w["rim"]), float(w["trigger"]), int(w["qty"])
-        # === FIX(live-risk): re-arm guard — skip symbols already held, in
-        # pos_state, or whose fill is still in-flight (no duplicate buy-stop).
         if sym in have or sym in self.pos_state or sym in self._in_flight:
             return
         ltp = prices.get(sym)
         if ltp is None or ltp >= trig or ltp < rim * (1 - self.near):
             return
-        # === FIX(live-risk): verify the buy-stop result BEFORE marking
-        # in-flight (a failed arm must not block the symbol nor fire a false
-        # ARMED alert).
-        sid = self._place_buy(sym, qty, trig)
-        if sid is None:
+        try:
+            sid = self._place_buy(sym, qty, trig)
+        except LiveOrderError as e:
+            # A failed arm must not block the symbol, nor fire a false ARMED alert.
+            log(f"  ARM   {sym}: buy-stop rejected: {e}")
+            self._alert("error", sym, f"buy-stop rejected: {e}")
             return
         self._in_flight.add(sym)
         if self.verbose:
             log(f"  ARM   {sym}: ltp {ltp} within 1% of rim {rim} -> buy-stop @ {trig} x{qty}")
         self._alert("armed", sym, ltp, trig, qty)
 
-    def _entry_pass(self, prices):
-        have = self._entry_have()
-        for w in self.watchlist:
-            self._entry_one(w, have, prices)
-
-    # === FIX(live-risk): R3-2 — per-symbol isolation used by cycle(): a rejected
-    # buy-stop (margin/circuit), a broker error, or a failed positions()/
-    # open_orders() scan is alerted and skipped instead of aborting the cycle
-    # (which would starve trailing / partial booking / the naked-position heal,
-    # all of which have already run).
     def _entry_pass_isolated(self, prices):
+        if self.max_positions:
+            committed = len(set(self.pos_state) | self._in_flight)
+            if committed >= self.max_positions:
+                if self.verbose:
+                    log(f"  cap reached ({committed}/{self.max_positions}) — no new arms")
+                return
         try:
             have = self._entry_have()
         except Exception as e:
@@ -388,17 +416,27 @@ class CupBot:
                     log(f"  ENTRY {sym} failed: {e} — continuing (exits already ran)")
                 self._alert("error", sym, f"entry failed: {e}")
 
-    # -- react to fills: entry -> start SL mgmt; stop-exit -> cleanup --
+    # -- react to broker.feed() fills: entry -> start SL mgmt; exit -> cleanup --
     def _on_fills(self, fills):
         for f in fills:
             sym = f["symbol"]
             if f["reason"] == "ENTRY":
+                if sym in self.pos_state:
+                    continue   # already reconciled (e.g. by _reconcile_live) — no duplicate
                 st = sl.PosState(entry=f["price"], qty_total=f["qty"], qty_remaining=f["qty"])
-                sid = self.broker.place_sell_stop(sym, f["qty"], st.sl, order_tag=self.tag)
+                try:
+                    sid = self._place_sell(sym, f["qty"], st.sl)
+                except LiveOrderError as e:
+                    log(f"  ERROR {sym}: entry filled but stop placement failed: {e}")
+                    self._alert("error", sym, f"STOP PLACEMENT FAILED after fill: {e}")
+                    # leave it out of pos_state; _reconcile_live's next pass will
+                    # see the live position and retry the adoption
+                    continue
                 self.pos_state[sym] = {"state": asdict(st), "sell_stop_id": sid}
                 self._in_flight.discard(sym)
+                self._save()
                 if self.verbose:
-                    log(f"  ENTRY {sym} filled @ {f['price']} x{f['qty']}  -> initial SL {st.sl} (sell-stop {sid})")
+                    log(f"  ENTRY {sym} filled @ {f['price']} x{f['qty']}  -> initial SL {st.sl} (stop {sid})")
                 self._alert("entry", sym, f["price"], f["qty"], st.sl)
             elif f["reason"] == "STOP_EXIT":
                 entry = (self.pos_state.get(sym, {}).get("state") or {}).get("entry", f["price"])
@@ -408,6 +446,8 @@ class CupBot:
                 self._alert("exit_", sym, f["price"], f["qty"], pnl)
                 self.pos_state.pop(sym, None)
                 self._in_flight.discard(sym)
+                self._gone_since.pop(sym, None)
+                self._save()
 
     # -- exit mgmt: run SL engine, trail the resting sell-stop, book partials --
     def _exit_pass(self, prices):
@@ -417,75 +457,147 @@ class CupBot:
             ltp = prices.get(sym)
             if not ps or ltp is None:
                 continue
-            st = sl.PosState(**ps["state"])
-            # === FIX(live-risk): self-heal — if a managed position has no live
-            # sell-stop resting (a replace failed after cancel), re-place it so
-            # the position is never naked.
-            if not ps.get("sell_stop_id"):
-                # === FIX(live-risk): R3-1/R3-3 — if the old stop's cancel is
-                # still unconfirmed, retry it and DEFER re-placement; never stack
-                # a second SELL-stop on top of one that may still be resting.
+
+            # Detect a stop that vanished WITHOUT a qty change we'd otherwise
+            # catch: a manual/exchange cancel, a DAY-validity expiry, or a
+            # rejection we didn't see the response for. _reconcile_live's
+            # qty-drift check (LIVE-only) can't see this — qty is unchanged,
+            # only the resting order is gone — so this check runs in every
+            # mode. Treat it exactly like "sell_stop_id was never set": the
+            # self-heal block right below re-places it this same cycle.
+            if ps.get("sell_stop_id") and not self._has_live_stop(sym):
+                if self.verbose:
+                    log(f"  HEAL  {sym}: recorded stop {ps['sell_stop_id']} no longer resting — will re-arm")
+                ps["sell_stop_id"] = None
+
+            # Self-heal: if a managed position has no live sell-stop resting (a
+            # resize/replace failed earlier, the exchange expired a DAY-
+            # validity stop overnight, or the check just above caught a stop
+            # that silently vanished), re-place it so the position is never
+            # left naked longer than one cycle.
+            #
+            # Skip it, though, when ltp has already breached the recorded SL
+            # this same cycle: re-arming a stop AT a price the market has
+            # already passed is at best a no-op and at worst a broker
+            # rejection (stop price behind the market). Leaving sell_stop_id
+            # unset here falls through to the "exits" branch below, which
+            # market-sells at the CURRENT ltp instead of a stale trigger.
+            if not ps.get("sell_stop_id") and ltp > ps["state"].get("sl", 0):
                 orphan = self._orphan_stops.get(sym)
                 if orphan and not self._cancel_tolerant(orphan, sym):
                     if self.verbose:
                         log(f"  HEAL  {sym}: old stop {orphan} not confirmed cancelled — deferring re-place")
                     continue
-                sid = self._place_sell(sym, st.qty_remaining, st.sl)
+                st0 = sl.PosState(**ps["state"])
+                try:
+                    sid = self._place_sell(sym, st0.qty_remaining, st0.sl)
+                except LiveOrderError as e:
+                    log(f"  ERROR {sym}: stop re-placement failed: {e}")
+                    self._alert("error", sym, f"UNPROTECTED — stop re-place failed: {e}")
+                    continue
                 ps["sell_stop_id"] = sid
-                ps.pop("_need_cancel", None)
                 self._save()
                 if self.verbose:
-                    log(f"  HEAL  {sym}: re-placed missing sell-stop {sid} @ {st.sl} x{st.qty_remaining}")
+                    log(f"  HEAL  {sym}: re-placed missing sell-stop {sid} @ {st0.sl} x{st0.qty_remaining}")
                 self._alert("error", sym, "re-placed missing protective sell-stop")
+
+            st = sl.PosState(**ps["state"])
             prev_sl, prev_phase = st.sl, st.phase
+            prev_state = dict(ps["state"])
             st, actions = sl.step(st, ltp)
 
+            # --- engine says the stop level was breached -----------------------------
+            exits = [a for a in actions if a[0] == "exit"]
+            if exits:
+                qty = int(exits[0][1]) or int(pos.get("qty") or 0)
+                if self._has_live_stop(sym):
+                    # the broker's resting stop will fill on its own; feed() (or
+                    # _reconcile_live) reports it next cycle. Don't fake an exit.
+                    log(f"  SL touched {sym} @ {ltp} — broker stop resting, awaiting fill")
+                    continue
+                log(f"  FALLBACK EXIT {sym}: no resting stop, selling {qty} at market")
+                try:
+                    self._mutate(self.broker.market_sell, sym, qty, ltp, order_tag=self.tag)
+                except Exception as e:
+                    log(f"  ERROR {sym}: fallback exit failed: {e}")
+                    self._alert("error", sym, f"EXIT FAILED: {e}")
+                    continue
+                pnl = (ltp - st.entry) * qty
+                self._alert("exit_", sym, ltp, qty, pnl)
+                self.pos_state.pop(sym, None)
+                self._gone_since.pop(sym, None)
+                self._save()
+                continue
+
+            # --- partial book at +20% -------------------------------------------------
             booked = [a for a in actions if a[0] == "book_partial"]
             if booked:
-                q, px = booked[0][1], booked[0][2]
-                # === FIX(live-risk): persist the SL-engine's mutation (reduced
-                # qty_remaining) BEFORE the broker ops, so a failure below still
-                # leaves the partial recorded (finding 1/3).
+                q, px = int(booked[0][1]), booked[0][2]
+                keep = int(st.qty_remaining)
+                # Persist the engine's mutation before the broker call. This is
+                # safe ONLY because _reconcile_live's qty-drift resync (LIVE) will
+                # correct any mismatch against the broker's real position on the
+                # very next cycle if the broker call below fails partway.
                 ps["state"] = asdict(st)
                 self._save()
-                # === FIX(live-risk): cancel the old full-qty stop FIRST, then
-                # market-sell the partial, then re-place the reduced stop — the
-                # old stop must not rest (and over-sell) during the partial sell.
-                res = self.broker.cancel(ps["sell_stop_id"])
-                self._check_live(res, "cancel", sym)
-                # old stop is now gone — mark SL missing so any later failure in
-                # this block leaves a self-healable (not stale) marker.
-                ps["sell_stop_id"] = None
-                res = self.broker.market_sell(sym, q, px)
-                self._check_live(res, "market_sell", sym)
                 try:
-                    sid = self._place_sell(sym, st.qty_remaining, st.sl)
-                except LiveOrderError:
-                    # === FIX(live-risk): mark the SL missing and persist BEFORE
-                    # re-raising, so a restart (or next-cycle self-heal) re-places
-                    # it instead of leaving the position naked.
+                    res = self._mutate(self.broker.modify_stop_qty, ps["sell_stop_id"], keep, st.sl,
+                                       symbol=sym, order_tag=self.tag)
+                except Exception as e:
+                    # Nothing changed at the broker (modify_stop_qty only mutates
+                    # after a confirmed cancel on its fallback path) — the OLD
+                    # stop is still resting at the OLD (full) qty, which still
+                    # matches the OLD (unsold) holding. Abort the sell this cycle;
+                    # LIVE's qty-drift resync will reconcile state either way.
+                    log(f"  ERROR {sym}: partial-book stop resize failed: {e} — not selling this cycle")
+                    self._alert("error", sym, f"PARTIAL BOOK STOP RESIZE FAILED: {e}")
+                    ps["state"] = prev_state
                     self._save()
-                    self._alert("error", sym, "replacement sell-stop failed after partial book")
-                    raise
-                ps["sell_stop_id"] = sid
+                    continue
+                if isinstance(res, dict) and res.get("id"):
+                    ps["sell_stop_id"] = str(res["id"])
+                try:
+                    self._mutate(self.broker.market_sell, sym, q, px, order_tag=self.tag)
+                except Exception as e:
+                    # Stop is already resized to `keep` — the booked qty is
+                    # briefly unprotected (documented tradeoff; see design doc)
+                    # until this retries. Do NOT restore the old stop size: the
+                    # position truly is down to `keep` in intent, and LIVE's
+                    # qty-drift resync will confirm/correct against the broker.
+                    log(f"  ERROR {sym}: partial-book market-sell failed: {e} — will retry")
+                    self._alert("error", sym, f"PARTIAL BOOK SELL FAILED (stop already resized): {e}")
+                    self._save()
+                    continue
                 self._save()
                 if self.verbose:
-                    log(f"  BOOK  {sym} +20%: sold {q} @ {px}; trail SL -> {st.sl}, keep {st.qty_remaining}")
-                self._alert("partial", sym, q, px, st.sl, st.qty_remaining)
-            elif st.sl != prev_sl:
-                # === FIX(live-risk): verify modify_stop in live mode, else a
-                # stale SL would silently keep protecting at the old level.
-                res = self.broker.modify_stop(ps["sell_stop_id"], st.sl)
-                self._check_live(res, "modify_stop", sym)
-                if self.verbose:
-                    tag = "breakeven" if prev_phase == "ACTIVE" else "trail"
-                    log(f"  SL    {sym} {tag}: SL {prev_sl} -> {st.sl} (high {st.highest})")
-                if prev_phase == "ACTIVE":
-                    self._alert("breakeven", sym, st.sl)
+                    log(f"  BOOK  {sym} +20%: sold {q} @ {px}; trail SL -> {st.sl}, keep {keep}")
+                self._alert("partial", sym, q, px, st.sl, keep)
+
+            # --- breakeven / trail ----------------------------------------------------
+            elif st.sl != prev_sl and ps.get("sell_stop_id"):
+                try:
+                    self._mutate(self.broker.modify_stop, ps["sell_stop_id"], st.sl)
+                except Exception as e:
+                    # Alert BEFORE the state marks the stop missing — this is the
+                    # gap the original flash-test branch had: a modify failure
+                    # here used to raise straight to run.py's bare print with no
+                    # Telegram ping, so a broken trail would fail completely
+                    # silently in production.
+                    log(f"  ERROR {sym}: SL modify failed: {e} — will re-place next cycle")
+                    self._alert("error", sym, f"SL MODIFY FAILED (will self-heal next cycle): {e}")
+                    ps["sell_stop_id"] = None
+                    self._save()
                 else:
-                    self._alert("trail", sym, st.sl, st.highest)
+                    if self.verbose:
+                        label = "breakeven" if prev_phase == "ACTIVE" else "trail"
+                        log(f"  SL    {sym} {label}: SL {prev_sl} -> {st.sl} (high {st.highest})")
+                    if prev_phase == "ACTIVE":
+                        self._alert("breakeven", sym, st.sl)
+                    else:
+                        self._alert("trail", sym, st.sl, st.highest)
 
             ps["state"] = asdict(st)
+            self._save()
 
 
 # ---------------------------------------------------------------------------

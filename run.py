@@ -10,14 +10,17 @@ MODE (from .env or env var):
 
   python run.py
 
-Prereqs: run `python auth.py` first (daily Fyers token -> token.json).
+Prereqs: run `python auth.py` first (daily Fyers token -> token.json), unless
+FYERS_ID/FYERS_TOTP_SECRET/FYERS_PIN are set in .env, in which case this file
+refreshes a stale/missing token itself via auth.get_token_totp() — see
+auth.py's module docstring for what that trades off before you turn it on.
 """
 import os
 import csv
 import time
 from datetime import datetime, timezone, timedelta
 
-from fyers_client import FyersClient, load_env
+from fyers_client import FyersClient, load_env, nse, SYMBOL_OVERRIDES
 from broker import PaperBroker, LiveBroker
 from bot import CupBot
 import notify
@@ -25,14 +28,21 @@ import notify
 IST = timezone(timedelta(hours=5, minutes=30))   # India has no DST
 
 
-def load_watchlist(path="watchlist.csv"):
+def load_watchlist(path="watchlist.csv", allow_t2t=False):
     wl = []
-    with open(path) as f:
-        for r in csv.DictReader(f):
-            wl.append({"symbol": r["symbol"].strip().upper(),
-                       "rim": float(r["rim"]),
-                       "trigger": float(r["trigger"]),
-                       "qty": int(float(r["qty"]))})
+    for r in csv.DictReader(open(path)):
+        sym = r["symbol"].strip().upper()
+        # T2T ("BE" series) stocks are delivery-only — a same-day SL-M stop
+        # can't execute intraday, so a naive watchlist entry for one is a
+        # silent trap: the bot will happily arm/track it, and the "protective"
+        # stop just never fires the way it does for a normal -EQ stock. Skip
+        # these unless the user has explicitly opted in.
+        if sym in SYMBOL_OVERRIDES and not allow_t2t:
+            print(f"  SKIP  {sym}: T2T/BE-series symbol — same-day SL can't "
+                  f"execute intraday. Set ALLOW_T2T=true in .env to include it anyway.")
+            continue
+        wl.append({"symbol": sym, "rim": float(r["rim"]),
+                   "trigger": float(r["trigger"]), "qty": int(float(r["qty"]))})
     return wl
 
 
@@ -50,11 +60,69 @@ def env(key, default):
     return os.getenv(key, cfg.get(key, default))
 
 
+def _ensure_fresh_token(cfg):
+    """token.json is only good for the trading day it was issued. If it's
+    missing/stale and TOTP env vars are configured, refresh it automatically;
+    otherwise tell the user to run `python auth.py` and stop, rather than
+    limping forward on a token FyersClient.from_files() may not even find."""
+    import json
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    stale = True
+    if os.path.exists("token.json"):
+        try:
+            blob = json.load(open("token.json"))
+            stale = blob.get("date") != today
+        except Exception:
+            stale = True
+    if not stale:
+        return
+    have_totp = all(cfg.get(k) for k in ("FYERS_ID", "FYERS_TOTP_SECRET", "FYERS_PIN"))
+    if not have_totp:
+        if not os.path.exists("token.json"):
+            print("No token.json found. Run `python auth.py` first (or set "
+                  "FYERS_ID/FYERS_TOTP_SECRET/FYERS_PIN in .env for auto-login).")
+        else:
+            print("token.json looks stale (not from today). Run `python auth.py` "
+                  "again, or set FYERS_ID/FYERS_TOTP_SECRET/FYERS_PIN in .env "
+                  "for this file to refresh it automatically.")
+        raise SystemExit(1)
+    import auth
+    print("token.json is missing/stale — refreshing via TOTP auto-login...")
+    auth.get_token_totp(cfg)   # raises auth.TotpLoginError on failure; never swallowed
+    print("✓ token refreshed.")
+
+
+def _funds_preflight(client):
+    """A cheap, early sanity check before going LIVE: confirm the token
+    actually works and print the available balance, so a bad/expired token
+    fails loudly here instead of on the first real order placement."""
+    try:
+        resp = client.funds()
+    except Exception as e:
+        print(f"FUNDS PREFLIGHT FAILED: {e}\nRefusing to start LIVE with an "
+              f"unverified token/connection.")
+        raise SystemExit(1)
+    if not isinstance(resp, dict) or resp.get("s") != "ok":
+        print(f"FUNDS PREFLIGHT FAILED: Fyers returned {resp!r}\nRefusing to "
+              f"start LIVE with an unverified token/connection.")
+        raise SystemExit(1)
+    bal = None
+    for row in resp.get("fund_limit", []):
+        if "available" in str(row.get("title", "")).lower():
+            bal = row.get("equityAmount", row.get("value"))
+            break
+    print(f"funds preflight ok" + (f" | available balance ~ Rs {bal}" if bal is not None else ""))
+
+
 def main():
+    cfg = load_env()
     mode = env("MODE", "paper").lower()
     poll = int(env("POLL_SEC", "30"))
     near = float(env("NEAR_PCT", "1.0")) / 100
     alerts = env("ALERTS", "true").lower() == "true"
+    max_positions = int(env("MAX_POSITIONS", "0"))       # 0 = unlimited
+    order_tag = env("ORDER_TAG", "cup")[:20]               # Fyers orderTag cap
+    allow_t2t = env("ALLOW_T2T", "false").lower() == "true"
 
     # --- LIVE safety guard: never trade real money by accident ---
     if mode == "live" and env("CONFIRM_LIVE", "").upper() != "YES":
@@ -62,19 +130,29 @@ def main():
               "Set CONFIRM_LIVE=YES in .env only when you truly intend real orders.")
         return
 
-    client = FyersClient.from_files()        # needs token.json (run auth.py)
-    watchlist = load_watchlist()
+    _ensure_fresh_token(cfg)
+    client = FyersClient.from_files()        # needs token.json (see auth.py)
+    watchlist = load_watchlist(allow_t2t=allow_t2t)
 
     if mode == "live":
-        broker, tag = LiveBroker(client), "LIVE"
+        _funds_preflight(client)
+        broker, tag = LiveBroker(client, tag=order_tag), "LIVE"
     else:
         broker, tag = PaperBroker(state_path="paper_state.json"), "PAPER"
 
-    bot = CupBot(broker, client.ltps, watchlist, near_pct=near, mode=tag, alerts=alerts)
+    # Separate bot_state per mode: PAPER's tracked positions/stop ids must
+    # never bleed into a LIVE run (or vice versa) if MODE is toggled between
+    # runs against the same working directory.
+    bot_state_path = f"bot_state_{tag.lower()}.json"
+    bot = CupBot(broker, client.ltps, watchlist, state_path=bot_state_path,
+                 near_pct=near, mode=tag, alerts=alerts, tag=order_tag,
+                 max_positions=max_positions)
 
-    print(f"[{tag}] runner start | {len(watchlist)} stocks | poll {poll}s | near {near*100:.1f}%")
+    print(f"[{tag}] runner start | {len(watchlist)} stocks | poll {poll}s | "
+          f"near {near*100:.1f}% | tag={order_tag} | max_positions={max_positions or 'unlimited'}")
     if alerts:
-        notify.send(f"🚀 <b>[{tag}] Cup bot started</b>\n{len(watchlist)} stocks | poll {poll}s | near {near*100:.1f}%")
+        notify.send(f"🚀 <b>[{tag}] Cup bot started</b>\n{len(watchlist)} stocks | "
+                    f"poll {poll}s | near {near*100:.1f}%")
 
     try:
         while True:
@@ -87,6 +165,8 @@ def main():
                           f"open orders {norders} | positions {npos}")
                 except Exception as e:
                     print(f"cycle error: {e}")
+                    if alerts:
+                        notify.send(f"⚠️ [{tag}] cycle error: {e}")
             else:
                 print(f"[{datetime.now(IST):%H:%M:%S}] market closed — idle")
             time.sleep(poll)

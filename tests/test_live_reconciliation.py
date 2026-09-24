@@ -75,6 +75,11 @@ def test_live_reconcile_does_not_duplicate_sell_stop(double, alert_log, tmp_path
     double.positions_map["WINNER"] = {"qty": 100, "avg": 100.0}
     bot = _bot(double, tmp_path, {"WINNER": 100.0})
     bot.pos_state["WINNER"] = {"state": _state(), "sell_stop_id": "L00001"}
+    # the stop must actually be resting at the broker, or the exit-pass
+    # stale-stop check (bot.py) will treat it as vanished and re-arm a new
+    # one — which is exactly the "duplicate stop" this test guards against.
+    double.pending.append({"id": "L00001", "symbol": "WINNER", "qty": 100,
+                           "trigger": 94.0, "side": "SELL", "status": "pending"})
 
     bot.cycle()
 

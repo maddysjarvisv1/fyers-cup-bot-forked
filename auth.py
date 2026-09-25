@@ -71,11 +71,24 @@ def _totp_now(secret_b32: str) -> str:
     return f"{code:06d}"
 
 
-def _post(url, payload, headers=None, what="request"):
-    h = {"User-Agent": _UA, "Content-Type": "application/json"}
+def _post(url, payload, headers=None, what="request", as_form=True):
+    """POST to Fyers, matching the content-type the endpoint actually expects.
+
+    The three `vagator/v2` OTP/login calls accept a **form-encoded** body
+    (the reference `tkanhe/fyers-api-access-token-v3` sends them as `data=`,
+    NOT `json=`); forcing Content-Type: application/json makes Fyers reject
+    `send_login_otp_v2` with `-1025 invalid request`. The final `token` call
+    wants a raw JSON *string* body with `Content-Type: application/json; charset=UTF-8`.
+
+    - as_form=True  -> body is a JSON string sent as `data=` (vagator calls)
+    - as_form=False -> for anything that needs an explicit JSON header (unused
+                       by the default flow; kept for completeness)
+    """
+    h = {"User-Agent": _UA}
     h.update(headers or {})
+    body = json.dumps(payload) if as_form else None
     try:
-        r = requests.post(url, json=payload, headers=h, timeout=15)
+        r = requests.post(url, data=body, headers=h, timeout=15)
         data = r.json()
     except Exception as e:
         raise TotpLoginError(f"{what}: request failed ({e}) — Fyers may have "
@@ -126,8 +139,11 @@ def totp_login(cfg) -> str:
     app_id_short = app_id[:-4] if len(app_id) > 4 else app_id   # "XXXX-100" -> "XXXX"
     r4 = _post(TOKEN_URL,
                {"fyers_id": fyers_id, "app_id": app_id_short, "redirect_uri": redirect_uri,
-                "response_type": "code", "create_cookie": True},
-               headers={"Authorization": f"Bearer {bearer}"}, what="token")
+                "appType": "100", "code_challenge": "", "state": "abcdefg", "scope": "",
+                "nonce": "", "response_type": "code", "create_cookie": True},
+               headers={"Authorization": f"Bearer {bearer}",
+                        "Content-Type": "application/json; charset=UTF-8"},
+               what="token")
     redirect_url = r4.get("Url") or r4.get("data", {}).get("Url", "")
     if "auth_code=" not in redirect_url:
         raise TotpLoginError(f"token step didn't return an auth_code — {r4}")

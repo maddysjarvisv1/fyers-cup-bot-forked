@@ -4,6 +4,7 @@ No OpenAlgo. Just: auth token load, quotes, orders, positions, funds.
 
 Symbol format for NSE equity: "NSE:SYMBOL-EQ"  (e.g. "NSE:SOTL-EQ")
 """
+import force_ipv4  # noqa: must be first — force IPv4 egress (Fyers IP-whitelist path)
 import os
 import json
 from fyers_apiv3 import fyersModel

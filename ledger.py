@@ -154,11 +154,20 @@ class Ledger:
         rows = self._rows("SELECT status, COUNT(*) n FROM cup_status GROUP BY status")
         return {r["status"]: r["n"] for r in rows}
 
-    def report(self, watchlist=None, prices=None, near_pct=0.02):
+    def report(self, watchlist=None, prices=None, near_pct=0.02, max_positions=None):
         """Dashboard view: lifecycle group counts + per-cup rows.
 
         ``watchlist`` - [{symbol, trigger, qty, rim}] => pre-trade candidates.
         ``prices``    - {SYM: ltp} => lets pre-trade cups split ready / getting_ready.
+        ``max_positions`` - position cap (if set) => drives the "caps full" hint.
+
+        Each cup gets a ``fire_status``:
+            in_trade   position open
+            ready      price reached its trigger but NO open position (
+                       breakout waiting to fire / held by the cap)
+            near       within ``near_pct`` of its trigger (getting ready)
+            cold       nowhere near
+        ``awaiting`` lists the fire-ready cups not currently in a position.
         """
         counts = {s: 0 for s in STATUSES}
         cups = []
@@ -166,18 +175,47 @@ class Ledger:
             for w in watchlist:
                 sym = str(w["symbol"]).upper()
                 stat = self._pre_state(sym, w, prices, near_pct)
-                cups.append(self._row(sym) or {
+                cup = self._row(sym) or {
                     "symbol": sym, "status": stat, "trigger": w.get("trigger"),
                     "rim": w.get("rim"), "qty": w.get("qty"),
                     "entry_price": None, "last_price": (prices or {}).get(sym),
-                    "pnl": 0, "error": None, "updated_at": None})
+                    "pnl": 0, "error": None, "updated_at": None}
+                cup["fire_status"] = self._fire_state(cup, prices, near_pct)
+                cups.append(cup)
         else:
             cups = self._rows("SELECT * FROM cup_status ORDER BY updated_at DESC")
+            for c in cups:
+                c["fire_status"] = self._fire_state(c, prices, near_pct)
         if cups:
             for c in cups:
                 counts[c["status"]] = counts.get(c["status"], 0) + 1
         counts = {s: counts.get(s, 0) for s in STATUSES}
-        return {"counts": counts, "cups": cups}
+        awaiting = [c for c in cups
+                    if c["fire_status"] == "ready"
+                    and c["status"] not in ("in_trade", "stop_loss", "error")]
+        return {
+            "counts": counts,
+            "cups": cups,
+            "awaiting": awaiting,
+            "awaiting_count": len(awaiting),
+            "cap_full": bool(max_positions and counts.get("in_trade", 0) >= max_positions),
+            "max_positions": max_positions,
+            "in_trade": counts.get("in_trade", 0),
+        }
+
+    def _fire_state(self, cup, prices, near_pct):
+        p = (prices or {}).get(cup.get("symbol")) if prices else None
+        if p is None:
+            p = cup.get("last_price")
+        trig = cup.get("trigger")
+        if cup.get("status") == "in_trade":
+            return "in_trade"
+        if p is not None and trig:
+            if p >= trig:
+                return "ready"
+            if p >= trig * (1 - near_pct):
+                return "near"
+        return "cold"
 
     def _pre_state(self, sym, w, prices, near_pct):
         p = (prices or {}).get(sym)

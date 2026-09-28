@@ -94,6 +94,26 @@ def test_report_pre_trade_split_by_price(tmp_path):
     assert r["counts"]["trade_ready"] == 1
 
 
+def test_report_flags_awaiting_ready_and_cap_full(tmp_path):
+    db = Ledger(str(tmp_path / "a.db"))
+    db.set_status("INPOS", "in_trade", trigger=100.0, entry_price=104.0)
+    wl = [{"symbol": "INPOS", "trigger": 100.0, "qty": 1, "rim": 96.0},
+          {"symbol": "WAIT1", "trigger": 200.0, "qty": 1, "rim": 192.0},
+          {"symbol": "COLD", "trigger": 300.0, "qty": 1, "rim": 288.0}]
+    prices = {"INPOS": 120.0, "WAIT1": 210.0, "COLD": 290.0}
+    r = db.report(watchlist=wl, prices=prices, max_positions=2)
+    fs = {c["symbol"]: c["fire_status"] for c in r["cups"]}
+    assert fs["INPOS"] == "in_trade"
+    assert fs["WAIT1"] == "ready"          # price passed trigger, no open position
+    assert fs["COLD"] == "cold"
+    aw = [c["symbol"] for c in r["awaiting"]]
+    assert "WAIT1" in aw and "INPOS" not in aw
+    r2 = db.report(watchlist=wl, prices=prices, max_positions=1)
+    assert r2["cap_full"] is True          # 1 in_trade >= cap 1 -> slot full
+    assert r2["awaiting_count"] == 1
+    assert r2["in_trade"] == 1
+
+
 def test_duplicate_status_is_idempotent(tmp_path):
     db = Ledger(str(tmp_path / "i.db"))
     db.set_status("S", "in_trade", entry_price=10.0)

@@ -23,6 +23,8 @@ from datetime import datetime, timezone, timedelta
 from fyers_client import FyersClient, load_env, nse, SYMBOL_OVERRIDES
 from broker import PaperBroker, LiveBroker
 from bot import CupBot
+from ledger import Ledger
+from tracking import Tracker
 import notify
 
 IST = timezone(timedelta(hours=5, minutes=30))   # India has no DST
@@ -144,9 +146,10 @@ def main():
     # never bleed into a LIVE run (or vice versa) if MODE is toggled between
     # runs against the same working directory.
     bot_state_path = f"bot_state_{tag.lower()}.json"
+    tracker = Tracker(ledger=Ledger("fyers_ledger.db"))
     bot = CupBot(broker, client.ltps, watchlist, state_path=bot_state_path,
                  near_pct=near, mode=tag, alerts=alerts, tag=order_tag,
-                 max_positions=max_positions)
+                 max_positions=max_positions, tracker=tracker)
 
     print(f"[{tag}] runner start | {len(watchlist)} stocks | poll {poll}s | "
           f"near {near*100:.1f}% | tag={order_tag} | max_positions={max_positions or 'unlimited'}")

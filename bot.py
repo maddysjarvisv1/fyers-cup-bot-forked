@@ -87,7 +87,7 @@ class CupBot:
     def __init__(self, broker, price_source, watchlist, state_path="bot_state.json",
                  near_pct=NEAR_PCT, verbose=True, mode="PAPER", alerts=False, tag="cup",
                  max_positions=0, gone_confirm_cycles=GONE_CONFIRM_CYCLES,
-                 adopt_watchlist_only=True):
+                 adopt_watchlist_only=True, tracker=None):
         self.broker = broker
         self.tag = tag                       # order tag / Algo-ID identifier
         self.price_source = price_source     # callable(symbols)->{SYM: ltp}
@@ -103,6 +103,7 @@ class CupBot:
         # already ours), so the bot cannot slap a stop on stock bought by hand
         # in the same account.
         self.adopt_watchlist_only = bool(adopt_watchlist_only)
+        self.tracker = tracker            # optional Tracking.Tracker -> ledger writes
         self.pos_state = {}                  # SYM -> {"state": {...}, "sell_stop_id": id}
         # Symbols whose entry buy-stop was placed this session but whose fill
         # has not yet produced a position. Intentionally NOT persisted — each
@@ -140,6 +141,8 @@ class CupBot:
         return self._watch_syms() | set(self._in_flight) | set(self.pos_state)
 
     def _alert(self, fn, *a, **k):
+        if self.tracker is not None:
+            self.tracker.on_alert(fn, *a)
         if not self.alerts:
             return
         import notify

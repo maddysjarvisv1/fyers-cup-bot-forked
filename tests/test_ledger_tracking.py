@@ -114,6 +114,27 @@ def test_report_flags_awaiting_ready_and_cap_full(tmp_path):
     assert r2["in_trade"] == 1
 
 
+def test_capital_budget_blocks_arm_when_breached(tmp_path):
+    broker = PaperBroker(state_path=str(tmp_path / "p.json"), reset=True)
+    # trigger*qty = 104*1000 = Rs1,04,000 > 50k budget
+    wl = [{"symbol": "BIG", "rim": 100.0, "trigger": 104.0, "qty": 1000}]
+    feed = ScriptedFeed({"BIG": [101.0]})   # within 1% of rim -> would normally arm
+    bot = CupBot(broker, feed, wl, state_path=str(tmp_path / "s.json"),
+                 mode="PAPER", verbose=False, capital_budget=50000)
+    bot.cycle()
+    assert not broker.open_orders()          # budget gate prevented the arm
+
+
+def test_capital_budget_allows_within(tmp_path):
+    broker = PaperBroker(state_path=str(tmp_path / "q.json"), reset=True)
+    wl = [{"symbol": "OK", "rim": 100.0, "trigger": 104.0, "qty": 10}]   # 1,040 < 50k
+    feed = ScriptedFeed({"OK": [101.0]})
+    bot = CupBot(broker, feed, wl, state_path=str(tmp_path / "u.json"),
+                 mode="PAPER", verbose=False, capital_budget=50000)
+    bot.cycle()
+    assert any(o["side"] == "BUY" for o in broker.open_orders())   # armed (within budget)
+
+
 def test_duplicate_status_is_idempotent(tmp_path):
     db = Ledger(str(tmp_path / "i.db"))
     db.set_status("S", "in_trade", entry_price=10.0)

@@ -87,7 +87,7 @@ class CupBot:
     def __init__(self, broker, price_source, watchlist, state_path="bot_state.json",
                  near_pct=NEAR_PCT, verbose=True, mode="PAPER", alerts=False, tag="cup",
                  max_positions=0, gone_confirm_cycles=GONE_CONFIRM_CYCLES,
-                 adopt_watchlist_only=True, tracker=None):
+                 adopt_watchlist_only=True, tracker=None, capital_budget=None):
         self.broker = broker
         self.tag = tag                       # order tag / Algo-ID identifier
         self.price_source = price_source     # callable(symbols)->{SYM: ltp}
@@ -104,6 +104,10 @@ class CupBot:
         # in the same account.
         self.adopt_watchlist_only = bool(adopt_watchlist_only)
         self.tracker = tracker            # optional Tracking.Tracker -> ledger writes
+        self.capital_budget = capital_budget  # ₹ cap on total deployed cup notional
+        # symbol -> (trigger, qty) so we can price a candidate's notional
+        self._wat = {str(w["symbol"]).upper(): (float(w["trigger"]), int(w["qty"]))
+                     for w in watchlist}
         self.pos_state = {}                  # SYM -> {"state": {...}, "sell_stop_id": id}
         # Symbols whose entry buy-stop was placed this session but whose fill
         # has not yet produced a position. Intentionally NOT persisted — each
@@ -377,12 +381,28 @@ class CupBot:
                 self._in_flight.discard(sym)
         return have
 
+    def _deployed_notional(self):
+        """₹ of cup notional currently committed (filled positions + armed buy-stops).
+        Only counts watchlist-symbol exposure (the ₹50k cup budget); unrelated
+        account positions (e.g. a NIFTY F&O) are not charged to it."""
+        wat = self._watch_syms()
+        d = sum(float(p.get("avg", 0)) * int(p.get("qty", 0))
+                for p in self.broker.positions() if p.get("symbol") in wat)
+        d += sum(self._wat.get(s, (0, 0))[0] * self._wat.get(s, (0, 0))[1]
+                 for s in self._in_flight)
+        return d
+
     def _entry_one(self, w, have, prices):
         sym, rim, trig, qty = w["symbol"], float(w["rim"]), float(w["trigger"]), int(w["qty"])
         if sym in have or sym in self.pos_state or sym in self._in_flight:
             return
         ltp = prices.get(sym)
         if ltp is None or ltp >= trig or ltp < rim * (1 - self.near):
+            return
+        if self.capital_budget and self._deployed_notional() + trig * qty > self.capital_budget:
+            if self.verbose:
+                log(f"  CAP   {sym}: would deploy ₹{trig*qty:.0f} -> exceeds budget ₹{self.capital_budget:.0f} — no arm")
+            self._alert("error", sym, f"capital budget ₹{self.capital_budget:.0f} exhausted — {sym} not armed")
             return
         try:
             sid = self._place_buy(sym, qty, trig)

@@ -123,6 +123,8 @@ def main():
     near = float(env("NEAR_PCT", "1.0")) / 100
     alerts = env("ALERTS", "true").lower() == "true"
     max_positions = int(env("MAX_POSITIONS", "0"))       # 0 = unlimited
+    capital_budget = env("CAPITAL_BUDGET", None)
+    capital_budget = int(capital_budget) if capital_budget else None
     order_tag = env("ORDER_TAG", "cup")[:20]               # Fyers orderTag cap
     allow_t2t = env("ALLOW_T2T", "false").lower() == "true"
 
@@ -149,7 +151,8 @@ def main():
     tracker = Tracker(ledger=Ledger("fyers_ledger.db"))
     bot = CupBot(broker, client.ltps, watchlist, state_path=bot_state_path,
                  near_pct=near, mode=tag, alerts=alerts, tag=order_tag,
-                 max_positions=max_positions, tracker=tracker)
+                 max_positions=max_positions, tracker=tracker,
+                 capital_budget=capital_budget)
 
     print(f"[{tag}] runner start | {len(watchlist)} stocks | poll {poll}s | "
           f"near {near*100:.1f}% | tag={order_tag} | max_positions={max_positions or 'unlimited'}")

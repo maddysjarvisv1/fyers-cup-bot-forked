@@ -68,6 +68,12 @@ class Handler(BaseHTTPRequestHandler):
         report = app.ledger.report(watchlist=watch, prices=app.get_prices(),
                                    max_positions=app.max_positions)
         report["pnl"] = pnl_stats(app.ledger)
+        if app.capital_budget:
+            used = sum(float(c.get("trigger") or 0) * float(c.get("qty") or 0)
+                       for c in report["cups"] if c.get("status") == "in_trade")
+            report["capital_budget"] = app.capital_budget
+            report["capital_used"] = used
+            report["capital_left"] = app.capital_budget - used
         return report
 
     def _api(self, path):
@@ -131,6 +137,7 @@ section{{display:inline-block;vertical-align:top;width:31%;margin:12px 6px;paddi
   <div><b>{counts['error']}</b><span> errors</span></div>
   <div><b>{counts['getting_ready']}</b><span> getting ready</span></div>
   <div><b>{counts['trade_ready']}</b><span> trade-ready</span></div>
+  <div><b>₹{report.get('capital_left', report.get('capital_budget') or 0):,.0f}</b><span> cap left {f'of ₹{report.get("capital_budget"):,.0f}' if report.get('capital_budget') else '(unset)'}</span></div>
 </div>
 {fire_html}
 {body_html}
@@ -154,11 +161,13 @@ section{{display:inline-block;vertical-align:top;width:31%;margin:12px 6px;paddi
 
 
 class App:
-    def __init__(self, db_path, watchlist, get_prices=lambda: {}, max_positions=None):
+    def __init__(self, db_path, watchlist, get_prices=lambda: {}, max_positions=None,
+                 capital_budget=None):
         self.ledger = Ledger(db_path)
         self.watchlist = watchlist
         self.get_prices = get_prices
         self.max_positions = max_positions
+        self.capital_budget = capital_budget
 
 
 def main(argv=None):
@@ -167,6 +176,7 @@ def main(argv=None):
     ap.add_argument("--db", default="fyers_ledger.db")
     ap.add_argument("--watchlist", default="watchlist.csv")
     ap.add_argument("--max-positions", type=int, default=None)
+    ap.add_argument("--capital-budget", type=int, default=None)
     a = ap.parse_args(argv)
     mp = a.max_positions
     if mp is None:
@@ -177,7 +187,16 @@ def main(argv=None):
                     break
         except (OSError, ValueError):
             mp = None
-    app = App(a.db, a.watchlist, max_positions=mp)
+    cb = a.capital_budget
+    if cb is None:
+        try:
+            for line in open(".env"):
+                if line.strip().startswith("CAPITAL_BUDGET="):
+                    cb = int(line.strip().split("=", 1)[1])
+                    break
+        except (OSError, ValueError):
+            cb = None
+    app = App(a.db, a.watchlist, max_positions=mp, capital_budget=cb)
     server = ThreadingHTTPServer(("0.0.0.0", a.port), Handler)
     server.app = app
     print(f"cup-bot dashboard on http://localhost:{a.port}  (db={a.db})")

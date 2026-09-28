@@ -142,6 +142,19 @@ class FyersClient:
         }
         return _order_id(self.fy.place_order(data), f"buy-stop {symbol}")
 
+    def place_buy_gtt(self, symbol, qty, trigger, product="CNC", validity="DAY", order_tag="cupbot"):
+        """Good-till-triggered BUY (bracket entry). Fires on the EXCHANGE when
+        LTP crosses ``trigger`` -- no polling needed. Returns the RAW fyers
+        response so a probe can inspect it; parse 's'/'id' from it.
+        Not part of the bot's normal entry path (the bot uses place_buy_stop)."""
+        data = {
+            "symbol": nse(symbol), "side": 1, "productType": product,
+            "orderInfo": {"leg1": {"qty": int(qty), "price": 0,
+                                   "triggerPrice": float(trigger)}},
+            "validity": validity,
+        }
+        return self.fy.place_gtt_order(data)
+
     def place_sell_stop(self, symbol, qty, trigger, product="CNC", order_tag="cupbot"):
         """SL-M SELL (stop-loss). type=3, side=-1. Returns order id (string)."""
         data = {

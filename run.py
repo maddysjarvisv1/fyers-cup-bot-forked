@@ -18,6 +18,7 @@ auth.py's module docstring for what that trades off before you turn it on.
 import os
 import csv
 import time
+import sys
 from datetime import datetime, timezone, timedelta
 
 from fyers_client import FyersClient, load_env, nse, SYMBOL_OVERRIDES
@@ -116,7 +117,25 @@ def _funds_preflight(client):
     print(f"funds preflight ok" + (f" | available balance ~ Rs {bal}" if bal is not None else ""))
 
 
+def _acquire_single_instance(lock_path="run.lock"):
+    """Prevent two cup-bots running on the same Fyers account.
+
+    A release-on-exit flock on a lockfile: if another run.py already holds
+    it, refuse to start. Prevents accidental duplicate live instances.
+    """
+    import fcntl
+    fh = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), lock_path), "a+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("Another cup-bot is already running (run.lock held). Refusing to start a duplicate.", flush=True)
+        sys.exit(2)
+    fh.seek(0); fh.truncate(); fh.write(str(os.getpid())); fh.flush()
+    return fh
+
+
 def main():
+    _lock_fh = _acquire_single_instance()   # single-instance guard: no parallel bots
     cfg = load_env()
     mode = env("MODE", "paper").lower()
     poll = int(env("POLL_SEC", "30"))

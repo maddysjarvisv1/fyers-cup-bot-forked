@@ -23,3 +23,4 @@ dist/
 *.sqlite3
 bot_state_live.json
 live_state.json
+run.lock

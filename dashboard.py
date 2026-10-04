@@ -173,6 +173,7 @@ class App:
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8123)
+    ap.add_argument("--host", default="0.0.0.0", help="bind address (use 127.0.0.1 behind an HTTPS proxy)")
     ap.add_argument("--db", default="fyers_ledger.db")
     ap.add_argument("--watchlist", default="watchlist.csv")
     ap.add_argument("--max-positions", type=int, default=None)
@@ -197,7 +198,7 @@ def main(argv=None):
         except (OSError, ValueError):
             cb = None
     app = App(a.db, a.watchlist, max_positions=mp, capital_budget=cb)
-    server = ThreadingHTTPServer(("0.0.0.0", a.port), Handler)
+    server = ThreadingHTTPServer((a.host, a.port), Handler)
     server.app = app
     print(f"cup-bot dashboard on http://localhost:{a.port}  (db={a.db})")
     try:

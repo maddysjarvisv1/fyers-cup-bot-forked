@@ -24,3 +24,6 @@ dist/
 bot_state_live.json
 live_state.json
 run.lock
+
+# intraday paper tracker runtime ledger
+intraday_paper/ledger.jsonl

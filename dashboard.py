@@ -21,6 +21,8 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from ledger import Ledger
+import urllib.parse as _up
+import auth_ui as _auth
 
 STATUS_LABEL = {
     "trade_ready": "Trade-ready",
@@ -57,10 +59,82 @@ def pnl_stats(ledger, symbol=None):
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path.startswith("/api"):
+        if self.path.startswith("/auth"):
+            self._auth_page()
+        elif self.path.startswith("/api"):
             self._api(self.path)
         else:
             self._html()
+
+    def do_POST(self):
+        # The ONLY write endpoint. Sits behind the Traefik + portal-gate ForwardAuth front
+        # (https-fyers anchor), so it is never reachable unauthenticated from the internet.
+        if not self.path.startswith("/auth"):
+            self.send_error(404); return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(min(n, 65536)).decode("utf-8", "replace")
+        except Exception:
+            self._json({"ok": False, "error": "could not read body"}); return
+        text = raw
+        if "auth_code=" not in text and "=" in text:
+            # allow a urlencoded form field: auth_url=... / url=... / code=...
+            try:
+                q = _up.parse_qs(raw)
+                for k in ("auth_url", "url", "text", "code"):
+                    if q.get(k):
+                        text = q[k][0] if k != "code" else "https://x/?auth_code=" + q[k][0]
+                        break
+            except Exception:
+                pass
+        try:
+            res = _auth.apply_from_text(text)
+        except Exception as e:
+            res = {"ok": False, "error": f"{e.__class__.__name__}: {str(e)[:200]}"}
+        self._json(res)   # result never contains the token or the code
+
+    def _json(self, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _auth_page(self):
+        st = _auth.status()
+        badge = ("<span style='color:#0a0'>FRESH</span>" if st["fresh"]
+                 else "<span style='color:#c00'>STALE — login needed</span>")
+        bot = ("<span style='color:#0a0'>running</span>" if st["bot_running"]
+               else "<span style='color:#c00'>down</span>")
+        page = f"""<!doctype html><html><head><meta charset="utf-8">
+<title>Fyers daily login</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{{font-family:system-ui,sans-serif;max-width:640px;margin:2rem auto;padding:0 1rem}}
+input,textarea{{width:100%;padding:.6rem;font-size:1rem;box-sizing:border-box}}
+button{{padding:.7rem 1.2rem;font-size:1rem;margin-top:.8rem}}
+.card{{border:1px solid #ddd;border-radius:8px;padding:1rem;margin:1rem 0}}
+pre{{background:#f6f6f6;padding:.8rem;border-radius:6px;overflow:auto}}</style></head><body>
+<h2>🔐 Fyers daily login</h2>
+<div class="card">Token date: <b>{st['token_date'] or 'none'}</b> · status: {badge}<br>
+Bot: {bot} {('pid ' + ', '.join(map(str, st['bot_pids']))) if st['bot_pids'] else ''}</div>
+<div class="card"><b>Paste the redirected URL here.</b>
+<p>Open the login link, sign in, then copy the <i>full</i> redirected URL (it contains
+<code>auth_code=...</code>) and paste it below. No PIN required.</p>
+<textarea id="u" rows="4" placeholder="https://trade.fyers.in/api-login/default.html?...&auth_code=...&state=jarvis_login"></textarea>
+<button onclick="go()">Exchange &amp; restart bot</button>
+<pre id="r">—</pre></div>
+<script>
+async function go(){{const r=document.getElementById('r');r.textContent='working…';
+ try{{const res=await fetch('/auth',{{method:'POST',headers:{{'Content-Type':'text/plain'}},
+  body:document.getElementById('u').value}});const j=await res.json();r.textContent=JSON.stringify(j,null,1);}}
+ catch(e){{r.textContent='error: '+e;}}}}
+</script></body></html>"""
+        body = page.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _payload(self):
         app = self.server.app
@@ -173,7 +247,7 @@ class App:
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8123)
-    ap.add_argument("--host", default="0.0.0.0", help="bind address (use 127.0.0.1 behind an HTTPS proxy)")
+    ap.add_argument("--host", default="127.0.0.1", help="bind address (default loopback: the Traefik https-fyers anchor reaches it; pass 0.0.0.0 only to deliberately expose a raw port)")
     ap.add_argument("--db", default="fyers_ledger.db")
     ap.add_argument("--watchlist", default="watchlist.csv")
     ap.add_argument("--max-positions", type=int, default=None)

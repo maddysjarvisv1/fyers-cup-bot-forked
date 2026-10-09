@@ -62,18 +62,62 @@ def extract_code(text):
 
 
 def bot_pids():
-    """PIDs of the live runner (run.py) only -- never dashboard.py, never this process."""
+    """PIDs of the live runner only (the python process executing run.py).
+
+    Deliberately strict: an earlier version matched any /proc cmdline containing the strings
+    'fyers-cup-bot-forked' and 'run.py', which ALSO matches a bash shell whose command TEXT
+    contains them (e.g. `bash -c 'cd .../fyers-cup-bot-forked && python run.py'`). That produced
+    false bot PIDs, so the restart logic killed the wrong things and the real runner kept the
+    run.lock -- the bot then refused to start and stayed on the previous day's dead token.
+    Here we require: the executable is a python interpreter AND some argv element ENDS WITH
+    'run.py', and no element contains 'dashboard.py'.
+    """
     pids = []
     for p in os.listdir("/proc"):
         if not p.isdigit():
             continue
         try:
-            cmd = open(f"/proc/{p}/cmdline", "rb").read().decode("utf-8", "replace")
+            exe = os.readlink(f"/proc/{p}/exe")
         except Exception:
             continue
-        if "fyers-cup-bot-forked" in cmd and "run.py" in cmd and "dashboard.py" not in cmd:
+        if "python" not in os.path.basename(exe):
+            continue          # excludes bash/sh wrappers entirely
+        try:
+            argv = open(f"/proc/{p}/cmdline", "rb").read().decode("utf-8", "replace").split("\0")
+        except Exception:
+            continue
+        argv = [a for a in argv if a]
+        if any(a.endswith("run.py") for a in argv) and not any("dashboard.py" in a for a in argv):
             pids.append(int(p))
     return pids
+
+
+def clear_stale_lock(path=None):
+    """Remove run.lock ONLY when its recorded PID is dead AND no live process holds it.
+    The bot refuses to start while run.lock exists, so a lock left by a killed runner would
+    otherwise strand it on the previous day's dead token. Never touch a live lock."""
+    path = path or os.path.join(BOT, "run.lock")
+    try:
+        pid = open(path).read().strip()
+    except Exception:
+        return False, "no lock file"
+    if pid and os.path.isdir(f"/proc/{pid}"):
+        return False, f"lock held by LIVE pid {pid}"
+    try:
+        import fcntl
+        f = open(path, "a+")
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(f, fcntl.LOCK_UN)
+        f.close()
+    except BlockingIOError:
+        return False, "lock still flock-held by a live process"
+    except Exception:
+        pass
+    try:
+        os.remove(path)
+        return True, f"removed stale lock (dead pid {pid or 'unknown'})"
+    except Exception as e:
+        return False, f"could not remove: {e}"
 
 
 def restart_bot():
@@ -90,6 +134,8 @@ def restart_bot():
         if not bot_pids():
             break
         time.sleep(0.5)
+
+    lock_ok, lock_msg = clear_stale_lock()
 
     launcher = (
         f"cd {BOT} && setsid nohup {PY} run.py >> {LOG} 2>&1 < /dev/null &"
@@ -110,7 +156,7 @@ def restart_bot():
                 if "funds preflight ok" in ln:
                     bal = ln.strip()
             return True, bal
-    return bool(bot_pids()), "relaunched, but funds preflight not yet seen in the log"
+    return bool(bot_pids()), f"relaunched ({lock_msg}); funds preflight not yet seen in the log"
 
 
 def apply_from_text(text):

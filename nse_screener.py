@@ -32,6 +32,7 @@ QUEUE_PCT = 5.0        # queue if current price within 5% below ATH
 BREAK_PCT = 2.0        # straight-to-buy if within 2% above ATH
 FIXED_LOSS = 750.0
 SL_PCT = 6.0 / 100
+MIN_AVG_VOLUME = 100000
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 NSE_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
@@ -66,6 +67,11 @@ def screen_symbol(sym):
         h = yf.Ticker(f"{sym}.NS").history(period="max", auto_adjust=True)
         if h.empty or len(h) < 10:
             return None
+        if "Volume" not in h.columns:
+            return None
+        avg_vol = float(h["Volume"].tail(60).mean())
+        if pd.isna(avg_vol) or avg_vol < MIN_AVG_VOLUME:
+            return None  # illiquid — 60-day avg volume below MIN_AVG_VOLUME
         ath_idx = h["High"].idxmax()
         ath = float(h["High"].max())
         adate = ath_idx.date()

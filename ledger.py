@@ -15,11 +15,17 @@ gitignored (``*.db``). Standard-library sqlite3 only.
 """
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _today():
+    return datetime.now(IST).strftime("%Y-%m-%d")
 
 
 STATUSES = ("trade_ready", "getting_ready", "order", "in_trade", "stop_loss", "error")
@@ -53,6 +59,21 @@ CREATE TABLE IF NOT EXISTS audit_events (
     ts      TEXT NOT NULL, event TEXT NOT NULL,
     symbol  TEXT, detail TEXT
 );
+CREATE TABLE IF NOT EXISTS missed_entries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    day         TEXT NOT NULL,
+    symbol      TEXT NOT NULL,
+    trigger     REAL,
+    rim         REAL,
+    qty         INTEGER,
+    ltp         REAL,
+    gap_pct     REAL,
+    reason      TEXT,
+    created_at  TEXT,
+    UNIQUE(day, symbol)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_missed_entries_day_symbol
+    ON missed_entries(day, symbol);
 """
 
 
@@ -135,6 +156,35 @@ class Ledger:
             "INSERT INTO audit_events (ts, event, symbol, detail) VALUES (?,?,?,?)",
             (_now(), event, symbol, detail))
 
+    def missed_entry(self, symbol, trigger, ltp, rim=None, qty=None,
+                     gap_pct=None, reason="gapped_up_past_trigger", day=None):
+        """Record a missed entry (gap-up past trigger). Idempotent per (day, symbol).
+
+        Returns True when a new row was inserted, False if already recorded today.
+        """
+        symbol = str(symbol).upper()
+        day = day or _today()
+        trigger = float(trigger)
+        ltp = float(ltp)
+        if gap_pct is None:
+            gap_pct = round((ltp - trigger) / trigger * 100.0, 4) if trigger else 0.0
+        c = self._conn()
+        try:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO missed_entries "
+                "(day, symbol, trigger, rim, qty, ltp, gap_pct, reason, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (day, symbol, trigger, rim, qty, ltp, gap_pct, reason, _now()),
+            )
+            c.commit()
+            inserted = cur.rowcount > 0
+        finally:
+            c.close()
+        if inserted:
+            self.audit("missed_entry", symbol,
+                       f"{reason} ltp={ltp} trigger={trigger} gap_pct={gap_pct:.2f}%")
+        return inserted
+
     # -- reads ---------------------------------------------------------------
     def trades_for(self, symbol, limit=50):
         return self._rows(
@@ -143,6 +193,32 @@ class Ledger:
     def orders_for(self, symbol, limit=20):
         return self._rows(
             "SELECT * FROM orders WHERE symbol=? ORDER BY id DESC LIMIT ?", (symbol, limit))
+
+    def missed_entries(self, day=None, symbol=None, limit=100):
+        clauses, params = [], []
+        if day:
+            clauses.append("day=?")
+            params.append(day)
+        if symbol:
+            clauses.append("symbol=?")
+            params.append(str(symbol).upper())
+        where = ("WHERE " + " AND ".join(clauses) + " ") if clauses else ""
+        params.append(limit)
+        return self._rows(
+            f"SELECT * FROM missed_entries {where}ORDER BY id DESC LIMIT ?",
+            tuple(params),
+        )
+
+    def missed_for(self, symbol, limit=50):
+        return self.missed_entries(symbol=symbol, limit=limit)
+
+    def has_missed_entry(self, symbol, day=None):
+        day = day or _today()
+        rows = self._rows(
+            "SELECT 1 FROM missed_entries WHERE day=? AND symbol=? LIMIT 1",
+            (day, str(symbol).upper()),
+        )
+        return bool(rows)
 
     def audit_for(self, symbol=None, limit=50):
         if symbol:
@@ -193,6 +269,7 @@ class Ledger:
         awaiting = [c for c in cups
                     if c["fire_status"] == "ready"
                     and c["status"] not in ("in_trade", "stop_loss", "error")]
+        missed = self.missed_entries()
         return {
             "counts": counts,
             "cups": cups,
@@ -201,6 +278,8 @@ class Ledger:
             "cap_full": bool(max_positions and counts.get("in_trade", 0) >= max_positions),
             "max_positions": max_positions,
             "in_trade": counts.get("in_trade", 0),
+            "missed_entries": missed,
+            "missed_count": len(missed),
         }
 
     def _fire_state(self, cup, prices, near_pct):

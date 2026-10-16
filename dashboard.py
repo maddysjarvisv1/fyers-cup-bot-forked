@@ -161,6 +161,7 @@ async function go(){{const r=document.getElementById('r');r.textContent='working
     def _html(self):
         report = self._payload()
         counts, cups, pnl = report["counts"], report["cups"], report["pnl"]
+        missed = report.get("missed_entries") or []
         groups = {}
         for c in cups:
             groups.setdefault(c["status"], []).append(c)
@@ -173,6 +174,12 @@ async function go(){{const r=document.getElementById('r');r.textContent='working
                 + ("<p class='none'>—</p>"
                    if not rows else "".join(self._cup_card(c) for c in rows))
                 + "</section>")
+        sec.append(
+            f'<section class="missed"><h3>Missed entries '
+            f'<span class="n">{len(missed)}</span></h3>'
+            + ("<p class='none'>—</p>"
+               if not missed else "".join(self._missed_card(m) for m in missed))
+            + "</section>")
         body_html = "".join(sec)
         aw = report.get("awaiting") or []
         if aw:
@@ -211,6 +218,7 @@ section{{display:inline-block;vertical-align:top;width:31%;margin:12px 6px;paddi
   <div><b>{counts['error']}</b><span> errors</span></div>
   <div><b>{counts['getting_ready']}</b><span> getting ready</span></div>
   <div><b>{counts['trade_ready']}</b><span> trade-ready</span></div>
+  <div><b>{len(missed)}</b><span> missed entries</span></div>
   <div><b>₹{report.get('capital_left', report.get('capital_budget') or 0):,.0f}</b><span> cap left {f'of ₹{report.get("capital_budget"):,.0f}' if report.get('capital_budget') else '(unset)'}</span></div>
 </div>
 {fire_html}
@@ -232,6 +240,19 @@ section{{display:inline-block;vertical-align:top;width:31%;margin:12px 6px;paddi
         return (f'<div class="card"><b>{html.escape(c["symbol"])}</b><br>'
                 f'<span class="m">trigger {c.get("trigger")}{tag_html}</span>'
                 f'{pnl_html}{err}</div>')
+
+    def _missed_card(self, m):
+        sym = html.escape(str(m.get("symbol") or ""))
+        day = html.escape(str(m.get("day") or ""))
+        trig = m.get("trigger")
+        ltp = m.get("ltp")
+        gap = m.get("gap_pct")
+        gap_str = f"+{float(gap):.2f}%" if gap is not None else "MISSED"
+        reason = html.escape(str(m.get("reason") or "gapped_up_past_trigger"))
+        return (f'<div class="card"><b>{sym}</b><br>'
+                f'<span class="m">{day} · trigger {trig} · ltp {ltp} '
+                f'<span class="tag">{html.escape(gap_str)}</span></span>'
+                f'<div class="m">rim {m.get("rim")} · qty {m.get("qty")} · {reason}</div></div>')
 
 
 class App:

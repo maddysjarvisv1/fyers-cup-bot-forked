@@ -48,6 +48,11 @@ def exit_(mode, sym, price, qty, pnl):
     icon = "✅" if pnl >= 0 else "🔴"
     send(f"{icon} <b>[{mode}] EXIT {sym}</b>\n@ {price} × {qty}\nP&L {pnl:+.0f}")
 
+def missed_entry(mode, sym, trigger, ltp, gap_pct=None, rim=None, qty=None, reason=None, day=None):
+    gap_str = f" ({float(gap_pct):+.2f}%)" if gap_pct is not None else ""
+    send(f"⏭️ <b>[{mode}] MISSED ENTRY {sym}</b>\n"
+         f"Trigger {trigger} | LTP {ltp}{gap_str} — gapped past trigger, not chasing")
+
 def error(mode, sym, msg):
     send(f"🚨 <b>[{mode}] CRITICAL {sym}</b>\n{msg}")
 

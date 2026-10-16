@@ -26,7 +26,7 @@ class Tracker:
         fn = getattr(self, f"_on_{event}", None)
         if fn:
             try:
-                fn(sym, *payload)
+                fn(sym, *payload, **extra)
             except Exception as e:                      # never break the trade path
                 self.ledger.audit("tracker_error", sym, f"{e}")
 
@@ -59,6 +59,13 @@ class Tracker:
 
     def _on_trail(self, sym, *a):
         self.ledger.audit("trail", sym)
+
+    def _on_missed_entry(self, sym, trigger, ltp, gap_pct=None, rim=None,
+                         qty=None, reason="gapped_up_past_trigger", day=None):
+        self.ledger.missed_entry(
+            sym, trigger=trigger, ltp=ltp, rim=rim, qty=qty,
+            gap_pct=gap_pct, reason=reason, day=day,
+        )
 
     def _on_error(self, sym, message):
         self.ledger.set_status(sym, "error", error=str(message)[:200])

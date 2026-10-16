@@ -14,7 +14,7 @@ import pytest
 _notify = types.ModuleType("notify")
 sys.modules["notify"] = _notify
 
-EVENTS = ["armed", "entry", "breakeven", "partial", "trail", "exit_", "error"]
+EVENTS = ["armed", "entry", "breakeven", "partial", "trail", "exit_", "error", "missed_entry"]
 
 # Seed no-op handlers so a test that runs a cycle without requesting the
 # alert_log fixture never trips an AttributeError on the shared fake module.

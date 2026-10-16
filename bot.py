@@ -87,7 +87,8 @@ class CupBot:
     def __init__(self, broker, price_source, watchlist, state_path="bot_state.json",
                  near_pct=NEAR_PCT, verbose=True, mode="PAPER", alerts=False, tag="cup",
                  max_positions=0, gone_confirm_cycles=GONE_CONFIRM_CYCLES,
-                 adopt_watchlist_only=True, tracker=None, capital_budget=None):
+                 adopt_watchlist_only=True, tracker=None, capital_budget=None,
+                 ledger=None):
         self.broker = broker
         self.tag = tag                       # order tag / Algo-ID identifier
         self.price_source = price_source     # callable(symbols)->{SYM: ltp}
@@ -103,6 +104,9 @@ class CupBot:
         # already ours), so the bot cannot slap a stop on stock bought by hand
         # in the same account.
         self.adopt_watchlist_only = bool(adopt_watchlist_only)
+        if tracker is None and ledger is not None:
+            from tracking import Tracker
+            tracker = Tracker(ledger=ledger)
         self.tracker = tracker            # optional Tracking.Tracker -> ledger writes
         self.capital_budget = capital_budget  # ₹ cap on total deployed cup notional
         # symbol -> (trigger, qty) so we can price a candidate's notional
@@ -120,18 +124,42 @@ class CupBot:
         # Retained and retried; never silently forgotten.
         self._orphan_stops = {}
         self._warned_foreign = set()
+        # Per-(day, symbol) dedupe for gap-up missed entries and already-traded symbols.
+        self._missed_today = set()
+        self._traded_today = set()
         self.day = _today()
+        self._last_clock_day = self.day
         if os.path.exists(state_path):
             blob = json.load(open(state_path))
             self.day = blob.pop("_day", self.day)
+            missed_raw = blob.pop("_missed_today", [])
+            traded_raw = blob.pop("_traded_today", [])
             self.pos_state = blob
+            if self.day == _today():
+                self._missed_today = {(self.day, str(s).upper()) for s in missed_raw}
+                self._traded_today = {(self.day, str(s).upper()) for s in traded_raw}
         if self.day != _today():
             # DAY-validity stops died at the close. Forget the ids; the exit-pass
             # self-heal (and, in LIVE, _reconcile_live) re-places them.
             for ps in self.pos_state.values():
                 ps["sell_stop_id"] = None
+            self._missed_today.clear()
+            self._traded_today.clear()
             self.day = _today()
+            self._last_clock_day = self.day
             log("  new trading day — stored stop ids cleared, stops will be re-placed")
+        for s in self.pos_state:
+            self._traded_today.add((self.day, str(s).upper()))
+        if self.tracker is not None and getattr(self.tracker, "ledger", None) is not None:
+            try:
+                for row in self.tracker.ledger.missed_entries(day=self.day):
+                    self._missed_today.add((self.day, str(row["symbol"]).upper()))
+            except Exception:
+                pass
+
+    @property
+    def ledger(self):
+        return getattr(self.tracker, "ledger", None) if self.tracker is not None else None
 
     def _watch_syms(self):
         return {w["symbol"].upper() for w in self.watchlist}
@@ -146,18 +174,28 @@ class CupBot:
 
     def _alert(self, fn, *a, **k):
         if self.tracker is not None:
-            self.tracker.on_alert(fn, *a)
+            self.tracker.on_alert(fn, *a, **k)
         if not self.alerts:
             return
         import notify
         if fn == "send":
             notify.send(*a, **k)
             return
-        getattr(notify, fn)(self.mode, *a, **k)
+        handler = getattr(notify, fn, None)
+        if handler is not None:
+            handler(self.mode, *a, **k)
+        elif hasattr(notify, "send"):
+            notify.send(f"[{self.mode}] {fn.upper()} " + " ".join(str(x) for x in a))
 
     def _save(self):
         blob = dict(self.pos_state)
         blob["_day"] = self.day
+        missed_for_day = sorted(s for d, s in self._missed_today if d == self.day)
+        if missed_for_day:
+            blob["_missed_today"] = missed_for_day
+        traded_for_day = sorted(s for d, s in self._traded_today if d == self.day)
+        if traded_for_day:
+            blob["_traded_today"] = traded_for_day
         json.dump(blob, open(self.state_path, "w"), indent=2)
 
     def _syms(self):
@@ -170,6 +208,14 @@ class CupBot:
         # writes out any earlier successful mutation this cycle (prevents a
         # restart from duplicating or re-booking work already done).
         try:
+            now_day = _today()
+            if now_day != self._last_clock_day:
+                for ps in self.pos_state.values():
+                    ps["sell_stop_id"] = None
+                self._missed_today.clear()
+                self._traded_today.clear()
+                self.day = now_day
+                self._last_clock_day = now_day
             prices = self.price_source(self._syms())
             fills = self.broker.feed(prices)          # accurate fill price, tag-based
             self._on_fills(fills)
@@ -292,6 +338,7 @@ class CupBot:
                 self._alert("error", sym, f"STOP PLACEMENT FAILED: {e}")
                 continue
             self.pos_state[sym] = {"state": asdict(st), "sell_stop_id": sid}
+            self._traded_today.add((self.day, sym.upper()))
             self._in_flight.discard(sym)
             self._save()   # persist immediately — a later failure in this loop can't lose it
             if self.verbose:
@@ -300,6 +347,7 @@ class CupBot:
 
         # POSITION GONE -> cleanup (never create a phantom sell-stop for it)
         for sym in list(self.pos_state):
+            self._traded_today.add((self.day, sym.upper()))
             ps = self.pos_state.get(sym)
             if not ps:
                 continue
@@ -396,12 +444,34 @@ class CupBot:
                  for s in self._in_flight)
         return d
 
+    def _record_missed_entry(self, sym, trig, rim, qty, ltp, reason="gapped_up_past_trigger"):
+        sym = str(sym).upper()
+        key = (self.day, sym)
+        if key in self._missed_today:
+            return
+        self._missed_today.add(key)
+        if self.tracker is not None and getattr(self.tracker, "ledger", None) is not None:
+            if self.tracker.ledger.has_missed_entry(sym, day=self.day):
+                return
+        gap_pct = round((float(ltp) - float(trig)) / float(trig) * 100.0, 4) if trig else 0.0
+        if self.verbose:
+            log(f"  MISS  {sym}: ltp {ltp} >= trigger {trig} ({gap_pct:+.2f}%) — {reason}, not chasing")
+        self._alert("missed_entry", sym, trig, float(ltp), gap_pct, rim, qty, reason, self.day)
+
     def _entry_one(self, w, have, prices):
         sym, rim, trig, qty = w["symbol"], float(w["rim"]), align_tick(float(w["trigger"])), int(w["qty"])
+        sym_u = sym.upper()
         if sym in have or sym in self.pos_state or sym in self._in_flight:
             return
+        if (self.day, sym_u) in self._missed_today or (self.day, sym_u) in self._traded_today:
+            return
         ltp = prices.get(sym)
-        if ltp is None or ltp >= trig or ltp < rim * (1 - self.near):
+        if ltp is None:
+            return
+        if ltp >= trig:
+            self._record_missed_entry(sym_u, trig, rim, qty, float(ltp))
+            return
+        if ltp < rim * (1 - self.near):
             return
         if self.capital_budget and self._deployed_notional() + trig * qty > self.capital_budget:
             if self.verbose:
@@ -447,6 +517,7 @@ class CupBot:
     def _on_fills(self, fills):
         for f in fills:
             sym = f["symbol"]
+            self._traded_today.add((self.day, sym.upper()))
             if f["reason"] == "ENTRY":
                 if sym in self.pos_state:
                     continue   # already reconciled (e.g. by _reconcile_live) — no duplicate
@@ -485,6 +556,7 @@ class CupBot:
             ltp = prices.get(sym)
             if not ps or ltp is None:
                 continue
+            self._traded_today.add((self.day, sym.upper()))
 
             # Detect a stop that vanished WITHOUT a qty change we'd otherwise
             # catch: a manual/exchange cancel, a DAY-validity expiry, or a

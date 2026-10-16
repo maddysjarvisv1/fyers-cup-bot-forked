@@ -740,3 +740,263 @@ def test_strict_unverifiable_surfaces_missing_live_feeds():
     assert any("price_band: CANNOT ENFORCE offline" in v for v in violations)
     assert any("sl_trigger_direction: CANNOT ENFORCE offline" in v for v in violations)
     assert RULE_ENFORCEABILITY["price_band"]["enforced_offline"] == "requires_ref_price_or_bounds"
+
+
+# ===========================================================================
+# 13. PRE-FLIGHT WIRING IN FyersClient (HARD BLOCK vs ADVISORY SEVERITY SPLIT)
+# ===========================================================================
+def _mock_client() -> FyersClient:
+    c = FyersClient.__new__(FyersClient)
+    c.warnings = []
+    c.fy = MagicMock()
+    c.fy.place_order.return_value = {"s": "ok", "id": "ORD-101"}
+    c.fy.place_gtt_order.return_value = {"s": "ok", "id": "GTT-101"}
+    c.fy.modify_order.return_value = {"s": "ok", "id": "ORD-101"}
+    return c
+
+
+def test_preflight_wiring_every_order_method_calls_validate_order_before_http(monkeypatch):
+    """Every order-placing method in FyersClient must invoke validate_order() BEFORE the HTTP call."""
+    import ast
+
+    fc_path = os.path.join(ROOT, "fyers_client.py")
+    with open(fc_path, "r", encoding="utf-8") as fh:
+        tree = ast.parse(fh.read(), filename="fyers_client.py")
+
+    order_methods = ("place_buy_stop", "place_buy_gtt", "place_sell_stop", "place_market_sell", "modify_order")
+    fc_cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "FyersClient")
+    methods = {n.name: n for n in fc_cls.body if isinstance(n, ast.FunctionDef)}
+    for m_name in order_methods:
+        assert m_name in methods, f"Missing {m_name} on FyersClient"
+        calls_validate = any(
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Name)
+            and sub.func.id == "validate_order"
+            for sub in ast.walk(methods[m_name])
+        )
+        assert calls_validate, f"FyersClient.{m_name} does not call validate_order()"
+
+    # Runtime spy: verify validate_order is called before each Fyers SDK call
+    call_log: list[str] = []
+    real_validate = fyers_client.validate_order
+
+    def spy_validate(*args, **kwargs):
+        call_log.append("validate_order")
+        return real_validate(*args, **kwargs)
+
+    monkeypatch.setattr(fyers_client, "validate_order", spy_validate)
+    c = _mock_client()
+    c.fy.place_order.side_effect = lambda d: (call_log.append("http_place_order"), {"s": "ok", "id": "ORD-1"})[1]
+    c.fy.place_gtt_order.side_effect = lambda d: (call_log.append("http_place_gtt"), {"s": "ok", "id": "GTT-1"})[1]
+    c.fy.modify_order.side_effect = lambda d: (call_log.append("http_modify"), {"s": "ok", "id": "ORD-1"})[1]
+
+    c.place_buy_stop("NAZARA", 28, 436.30)
+    c.place_buy_gtt("NAZARA", 28, 436.30)
+    c.place_sell_stop("NAZARA", 28, 410.10)
+    c.place_market_sell("NAZARA", 14)
+    c.modify_order("ORD-1", stop_price=420.00, qty=14)
+
+    assert call_log == [
+        "validate_order", "http_place_order",
+        "validate_order", "http_place_gtt",
+        "validate_order", "http_place_order",
+        "validate_order", "http_place_order",
+        "validate_order", "http_modify",
+    ]
+
+
+def test_preflight_hard_block_rules_each_raise_with_rule_named():
+    """Each HARD-BLOCK rule must raise FyersError before any HTTP call, naming the rule in the message."""
+    c = _mock_client()
+
+    # 1. Unaligned tick -> tick_size
+    with pytest.raises(FyersError, match=r"tick_size:.*436\.28"):
+        c.place_buy_stop("NAZARA", 28, 436.28)
+    with pytest.raises(FyersError, match=r"tick_size:.*410\.122"):
+        c.place_sell_stop("NAZARA", 28, 410.122)
+    with pytest.raises(FyersError, match=r"tick_size:.*436\.28"):
+        c.place_buy_gtt("NAZARA", 28, 436.28)
+    with pytest.raises(FyersError, match=r"tick_size:.*436\.28"):
+        c.modify_order("ORD-1", stop_price=436.28)
+
+    # 2. Bad lot -> lot_size
+    with pytest.raises(FyersError, match=r"lot_size:.*not a multiple of lot size 75"):
+        c.place_buy_stop("NSE:NIFTY26OCT22400CE", 50, 100.0, product="MARGIN")
+    with pytest.raises(FyersError, match=r"lot_size:.*lot size 30"):
+        c.place_sell_stop("NAZARA", 10, 410.10, lot_size=30)
+    with pytest.raises(FyersError, match=r"lot_size:"):
+        c.place_market_sell("NAZARA", 0)
+
+    # 3. Over-freeze qty -> freeze_quantity
+    with pytest.raises(FyersError, match=r"freeze_quantity:.*exceeds NSE freeze limit 100000"):
+        c.place_buy_stop("IDEA", 150_000, 10.0)
+    with pytest.raises(FyersError, match=r"freeze_quantity:.*exceeds NSE freeze limit 1800"):
+        c.place_buy_stop("NSE:NIFTY26OCT22400CE", 1875, 100.0, product="MARGIN")
+    with pytest.raises(FyersError, match=r"freeze_quantity:"):
+        c.modify_order("ORD-1", stop_price=410.10, qty=150_000)
+
+    # 4. T2T symbol -> t2t_series (and retains T2T/BE-series delivery-only message)
+    with pytest.raises(FyersError, match=r"t2t_series:"):
+        c.place_buy_stop("BAFNAPH", 10, 100.0)
+    with pytest.raises(FyersError, match=r"t2t_series:"):
+        c.place_sell_stop("NSE:CUSTOM-BE", 10, 94.0)
+    with pytest.raises(FyersError, match=r"t2t_series:"):
+        c.place_buy_gtt("SWANDEF", 10, 100.0)
+
+    # 5. Out-of-hours non-AMO order -> market_hours
+    after_hours = datetime(2026, 10, 16, 18, 0, 0, tzinfo=IST)
+    with pytest.raises(FyersError, match=r"market_hours:.*outside 09:15-15:30 IST"):
+        c.place_buy_stop("NAZARA", 28, 436.30, now=after_hours)
+    with pytest.raises(FyersError, match=r"market_hours:"):
+        c.place_sell_stop("NAZARA", 28, 410.10, now=after_hours)
+    with pytest.raises(FyersError, match=r"market_hours:"):
+        c.place_market_sell("NAZARA", 14, now=after_hours)
+    with pytest.raises(FyersError, match=r"market_hours:"):
+        c.modify_order("ORD-1", stop_price=410.10, now=after_hours)
+
+    # 6. Additional hard-block rules: symbol_format, sl_trigger_direction, product_type, validity, order_tag, duplicate_guard
+    with pytest.raises(FyersError, match=r"symbol_format:"):
+        c.place_buy_stop("NYSE:AAPL", 10, 100.0)
+    with pytest.raises(FyersError, match=r"sl_trigger_direction:"):
+        c.place_buy_stop("NAZARA", 28, 436.30, ltp=440.0)
+    with pytest.raises(FyersError, match=r"product_type:"):
+        c.place_buy_stop("NAZARA", 28, 436.30, product="INTRADAY")
+    with pytest.raises(FyersError, match=r"validity:"):
+        c.place_buy_gtt("NAZARA", 28, 436.30, validity="IOC")
+    with pytest.raises(FyersError, match=r"order_tag:"):
+        c.place_buy_stop("NAZARA", 28, 436.30, order_tag="bad_tag!")
+    with pytest.raises(FyersError, match=r"duplicate_guard:"):
+        c.place_sell_stop(
+            "NAZARA",
+            28,
+            410.10,
+            open_orders=[{"id": "S1", "symbol": "NAZARA", "side": "SELL", "qty": 28, "status": "pending"}],
+        )
+
+    # Zero HTTP calls were made across all hard-block rejections
+    assert c.fy.place_order.call_count == 0
+    assert c.fy.place_gtt_order.call_count == 0
+    assert c.fy.modify_order.call_count == 0
+
+
+def test_preflight_advisory_violation_warns_and_still_sends(caplog, alert_log):
+    """An ADVISORY violation (price_band / order_value_cap) must NOT block:
+    the order still goes out AND a warning with the rule name and reason is recorded."""
+    import logging
+
+    c = _mock_client()
+    caplog.set_level(logging.WARNING)
+
+    # Advisory 1: price_band violation (trigger 436.30 is outside ±20% band around stale ref_price=350.0 -> [280, 420])
+    with pytest.warns(UserWarning, match=r"price_band:"):
+        oid = c.place_buy_stop("NAZARA", 28, 436.30, ref_price=350.0, band_pct=20.0)
+
+    # Assert BOTH the send AND the warning
+    assert oid == "ORD-101"
+    assert c.fy.place_order.call_count == 1
+    sent_payload = c.fy.place_order.call_args[0][0]
+    assert sent_payload["symbol"] == "NSE:NAZARA-EQ"
+    assert sent_payload["stopPrice"] == 436.30
+    assert sent_payload["qty"] == 28
+
+    assert len(c.warnings) == 1
+    assert "price_band:" in c.warnings[0]
+    assert "outside ±20% circuit band [280.00, 420.00]" in c.warnings[0]
+    assert any("price_band:" in rec.message for rec in caplog.records)
+    assert any("price_band:" in a[2] for a in alert_log["error"])
+
+    # Advisory 2: order_value_cap violation (200 * 436.30 = Rs 87,260 > Rs 50,000 cap) also warns and still sends
+    with pytest.warns(UserWarning, match=r"order_value_cap:"):
+        oid2 = c.place_sell_stop("NAZARA", 200, 436.30, max_order_value=50_000.0)
+
+    assert oid2 == "ORD-101"
+    assert c.fy.place_order.call_count == 2
+    assert len(c.warnings) == 2
+    assert "order_value_cap:" in c.warnings[1]
+    assert "87,260.00" in c.warnings[1]
+
+
+def test_preflight_multiple_violations_reports_all_of_them():
+    """When validate_order returns MULTIPLE violations, FyersClient must report ALL of them, not just the first."""
+    c = _mock_client()
+    after_hours = datetime(2026, 10, 17, 19, 0, 0, tzinfo=IST)
+
+    with pytest.raises(FyersError) as exc_info:
+        c.place_buy_stop(
+            "BAFNAPH",                   # t2t_series
+            150_000,                     # freeze_quantity + lot_size (150_000 % 70 != 0) + order_value_cap
+            436.28,                      # tick_size + price_band (vs ref_price=300)
+            product="INTRADAY",          # product_type
+            order_tag="bad_tag!_long",   # order_tag
+            lot_size=70,                 # lot_size
+            ref_price=300.0,
+            band_pct=5.0,
+            now=after_hours,             # market_hours
+        )
+
+    msg = str(exc_info.value)
+    for expected_rule in (
+        "tick_size:",
+        "lot_size:",
+        "freeze_quantity:",
+        "price_band:",
+        "order_value_cap:",
+        "t2t_series:",
+        "product_type:",
+        "market_hours:",
+        "order_tag:",
+    ):
+        assert expected_rule in msg, f"Expected {expected_rule!r} in multi-violation FyersError:\n{msg}"
+
+    assert c.fy.place_order.call_count == 0
+
+
+def test_preflight_happy_path_valid_orders_pass_untouched():
+    """Valid orders pass untouched with no regression on the happy path."""
+    c = _mock_client()
+
+    # Normal aligned CNC BUY stop (NAZARA 436.30 x 28)
+    buy_id = c.place_buy_stop("NAZARA", 28, 436.30, product="CNC", order_tag="cupbot")
+    assert buy_id == "ORD-101"
+    assert c.warnings == []
+    assert c.fy.place_order.call_count == 1
+    assert c.fy.place_order.call_args[0][0] == {
+        "symbol": "NSE:NAZARA-EQ",
+        "qty": 28,
+        "type": 3,
+        "side": 1,
+        "productType": "CNC",
+        "limitPrice": 0,
+        "stopPrice": 436.30,
+        "validity": "DAY",
+        "offlineOrder": False,
+        "orderTag": "cupbot",
+    }
+
+    # Normal aligned CNC SELL stop (NAZARA 410.10 x 28)
+    sell_id = c.place_sell_stop("NAZARA", 28, 410.10, product="CNC", order_tag="cupbot")
+    assert sell_id == "ORD-101"
+    assert c.warnings == []
+    assert c.fy.place_order.call_count == 2
+    assert c.fy.place_order.call_args[0][0] == {
+        "symbol": "NSE:NAZARA-EQ",
+        "qty": 28,
+        "type": 3,
+        "side": -1,
+        "productType": "CNC",
+        "limitPrice": 0,
+        "stopPrice": 410.10,
+        "validity": "DAY",
+        "offlineOrder": False,
+        "orderTag": "cupbot",
+    }
+
+    # Normal market sell, buy GTT, and modify_order
+    mkt_id = c.place_market_sell("NAZARA", 14, product="CNC", order_tag="cupbot")
+    assert mkt_id == "ORD-101"
+    gtt_res = c.place_buy_gtt("NAZARA", 28, 436.30, product="CNC", validity="GTT", order_tag="cupbot")
+    assert gtt_res == {"s": "ok", "id": "GTT-101"}
+    mod_res = c.modify_order("ORD-101", stop_price=420.05, qty=14)
+    assert mod_res == {"s": "ok", "id": "ORD-101"}
+    assert c.warnings == []
+

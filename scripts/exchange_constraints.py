@@ -1060,13 +1060,17 @@ def validate_order(
         if not ok_band:
             violations.append(reason_band)
 
-    # 5. Order value cap
-    ok_val_cap, reason_val_cap = check_order_value_cap(qty, price, max_order_value=max_order_value)
-    if not ok_val_cap:
-        violations.append(reason_val_cap)
+    # 5. Order value cap (for market orders with price=0, use ltp/ref_price if given)
+    val_price = price
+    if not is_stop and isinstance(price, (int, float, Decimal)) and float(price) == 0.0:
+        val_price = ltp if ltp is not None else ref_price
+    if val_price is not None and (is_stop or not (isinstance(val_price, (int, float, Decimal)) and float(val_price) == 0.0)):
+        ok_val_cap, reason_val_cap = check_order_value_cap(qty, val_price, max_order_value=max_order_value)
+        if not ok_val_cap:
+            violations.append(reason_val_cap)
 
     # 6. T2T / -BE series
-    ok_t2t, reason_t2t = check_t2t_series(symbol, allow_t2t=allow_t2t, same_day_stop_strategy=is_stop)
+    ok_t2t, reason_t2t = check_t2t_series(symbol, allow_t2t=allow_t2t, same_day_stop_strategy=True)
     if not ok_t2t:
         violations.append(reason_t2t)
 
@@ -1119,6 +1123,60 @@ def validate_order(
             violations.append(reason_dir)
 
     return violations
+
+
+# ---------------------------------------------------------------------------
+# Severity Split: HARD BLOCK vs ADVISORY (WARN ONLY)
+# ---------------------------------------------------------------------------
+HARD_BLOCK_RULES: frozenset[str] = frozenset({
+    "tick_size",
+    "lot_size",
+    "freeze_quantity",
+    "t2t_series",
+    "symbol_format",
+    "side",
+    "sl_trigger_direction",
+    "product_type",
+    "validity",
+    "market_hours",
+    "order_tag",
+    "duplicate_guard",
+})
+
+ADVISORY_RULES: frozenset[str] = frozenset({
+    "price_band",
+    "price_bands",
+    "order_value_cap",
+    "order_value",
+})
+
+
+def get_violation_rule(violation: str) -> str:
+    """Extract the canonical rule name prefix from a violation string."""
+    if not isinstance(violation, str):
+        return "unknown"
+    head = violation.split(":", 1)[0].strip().lower()
+    if head == "price_bands":
+        return "price_band"
+    if head == "order_value":
+        return "order_value_cap"
+    return head or "unknown"
+
+
+def classify_violations(violations: list[str]) -> tuple[list[str], list[str]]:
+    """Split ``validate_order`` violations into ``(hard_errors, advisory_warnings)``.
+
+    Every violation is preserved with its rule name and reason — none are swallowed.
+    """
+    hard_errors: list[str] = []
+    advisory_warnings: list[str] = []
+    for v in violations or []:
+        rule = get_violation_rule(v)
+        if rule in ADVISORY_RULES:
+            advisory_warnings.append(v)
+        else:
+            hard_errors.append(v)
+    return hard_errors, advisory_warnings
 
 
 # ---------------------------------------------------------------------------

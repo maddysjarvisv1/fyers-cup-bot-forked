@@ -253,12 +253,15 @@ class FyersClient:
         allow_t2t=False,
         **validate_kwargs,
     ):
-        """SL-M BUY (buy-stop). Fyers: type=3 (Stop/SL-M), side=1 (buy).
+        """SL-M BUY (buy-stop) with GTT validity so breakout entries survive close.
+        Fyers: type=3 (Stop/SL-M), side=1 (buy), validity='GTT'.
         order_tag -> Fyers orderTag (strategy identifier; the Algo-ID hook).
-        Returns the broker order id (string). Raises FyersError on rejection."""
+        Returns the broker order id (string). Raises FyersError on rejection or non-GTT validity."""
         from broker import align_tick
-        validity = validate_kwargs.pop("validity", "DAY")
+        validity = validate_kwargs.pop("validity", "GTT")
         offline_order = bool(validate_kwargs.pop("offline_order", False))
+        overnight_position = bool(validate_kwargs.pop("overnight_position", True))
+        has_next_day_rearm = bool(validate_kwargs.pop("has_next_day_rearm", False))
         now = _resolve_now(self, validate_kwargs.pop("now", None))
         violations = validate_order(
             symbol,
@@ -269,6 +272,8 @@ class FyersClient:
             validity,
             allow_t2t=allow_t2t,
             is_stop=True,
+            overnight_position=overnight_position,
+            has_next_day_rearm=has_next_day_rearm,
             offline_order=offline_order,
             order_tag=order_tag,
             now=now,
@@ -280,6 +285,11 @@ class FyersClient:
             symbol=symbol,
             allow_t2t=allow_t2t,
         )
+        if str(validity or "").upper().strip() != "GTT":
+            raise FyersError(
+                f"buy-stop {symbol} refused: validity={validity!r} must be 'GTT' "
+                f"(never silently downgrade entry stop to DAY)"
+            )
         if is_t2t_symbol(symbol) and not allow_t2t:
             raise FyersError(
                 f"buy-stop {symbol} refused: {nse(symbol)} is a T2T/BE-series delivery-only stock "
@@ -293,7 +303,7 @@ class FyersClient:
             "productType": product,   # CNC / INTRADAY / MARGIN
             "limitPrice": 0,
             "stopPrice": align_tick(trigger),
-            "validity": validity,
+            "validity": "GTT",
             "offlineOrder": offline_order,
             "orderTag": str(order_tag)[:20],
         }
@@ -305,17 +315,18 @@ class FyersClient:
         qty,
         trigger,
         product="CNC",
-        validity="DAY",
+        validity="GTT",
         order_tag="cupbot",
         allow_t2t=False,
         **validate_kwargs,
     ):
-        """Good-till-triggered BUY (bracket entry). Fires on the EXCHANGE when
-        LTP crosses ``trigger`` -- no polling needed. Returns the RAW fyers
-        response so a probe can inspect it; parse 's'/'id' from it.
-        Not part of the bot's normal entry path (the bot uses place_buy_stop)."""
+        """Good-till-triggered BUY via Fyers GTT endpoint (/gtt/orders/sync).
+        Fires on the EXCHANGE when LTP crosses ``trigger`` -- no polling needed.
+        Validates response via _ok() and raises FyersError on failure or non-GTT validity."""
         from broker import align_tick
         offline_order = bool(validate_kwargs.pop("offline_order", False))
+        overnight_position = bool(validate_kwargs.pop("overnight_position", True))
+        has_next_day_rearm = bool(validate_kwargs.pop("has_next_day_rearm", False))
         now = _resolve_now(self, validate_kwargs.pop("now", None))
         violations = validate_order(
             symbol,
@@ -326,6 +337,8 @@ class FyersClient:
             validity,
             allow_t2t=allow_t2t,
             is_stop=True,
+            overnight_position=overnight_position,
+            has_next_day_rearm=has_next_day_rearm,
             offline_order=offline_order,
             order_tag=order_tag,
             now=now,
@@ -337,6 +350,11 @@ class FyersClient:
             symbol=symbol,
             allow_t2t=allow_t2t,
         )
+        if str(validity or "").upper().strip() != "GTT":
+            raise FyersError(
+                f"buy-gtt {symbol} refused: validity={validity!r} must be 'GTT' "
+                f"(never silently downgrade GTT order to DAY)"
+            )
         if is_t2t_symbol(symbol) and not allow_t2t:
             raise FyersError(
                 f"buy-gtt {symbol} refused: {nse(symbol)} is a T2T/BE-series delivery-only stock "
@@ -346,9 +364,67 @@ class FyersClient:
             "symbol": nse(symbol), "side": 1, "productType": product,
             "orderInfo": {"leg1": {"qty": int(qty), "price": 0,
                                    "triggerPrice": align_tick(trigger)}},
-            "validity": validity,
+            "validity": "GTT",
         }
-        return self.fy.place_gtt_order(data)
+        return _ok(self.fy.place_gtt_order(data), f"buy-gtt {symbol}")
+
+    def place_sell_gtt(
+        self,
+        symbol,
+        qty,
+        trigger,
+        product="CNC",
+        validity="GTT",
+        order_tag="cupbot",
+        allow_t2t=False,
+        **validate_kwargs,
+    ):
+        """Good-till-triggered protective SELL via Fyers GTT endpoint (/gtt/orders/sync).
+        Validates response via _ok() and raises FyersError on failure or non-GTT validity."""
+        from broker import align_tick
+        offline_order = bool(validate_kwargs.pop("offline_order", False))
+        overnight_position = bool(validate_kwargs.pop("overnight_position", True))
+        has_next_day_rearm = bool(validate_kwargs.pop("has_next_day_rearm", False))
+        now = _resolve_now(self, validate_kwargs.pop("now", None))
+        violations = validate_order(
+            symbol,
+            "SELL",
+            qty,
+            trigger,
+            product,
+            validity,
+            allow_t2t=allow_t2t,
+            is_stop=True,
+            overnight_position=overnight_position,
+            has_next_day_rearm=has_next_day_rearm,
+            offline_order=offline_order,
+            order_tag=order_tag,
+            now=now,
+            **validate_kwargs,
+        )
+        self._enforce_preflight(
+            violations,
+            what=f"sell-gtt {symbol}",
+            symbol=symbol,
+            allow_t2t=allow_t2t,
+        )
+        if str(validity or "").upper().strip() != "GTT":
+            raise FyersError(
+                f"sell-gtt {symbol} refused: validity={validity!r} must be 'GTT' "
+                f"(never silently downgrade GTT stop to DAY)"
+            )
+        if is_t2t_symbol(symbol) and not allow_t2t:
+            raise FyersError(
+                f"sell-gtt {symbol} refused: {nse(symbol)} is a T2T/BE-series delivery-only stock "
+                f"(no intraday square-off; same-day SL cannot execute)"
+            )
+        data = {
+            "symbol": nse(symbol), "side": -1, "productType": product,
+            "orderInfo": {"leg1": {"qty": int(qty), "price": 0,
+                                   "triggerPrice": align_tick(trigger)}},
+            "validity": "GTT",
+        }
+        return _ok(self.fy.place_gtt_order(data), f"sell-gtt {symbol}")
 
     def place_sell_stop(
         self,
@@ -360,10 +436,14 @@ class FyersClient:
         allow_t2t=False,
         **validate_kwargs,
     ):
-        """SL-M SELL (stop-loss). type=3, side=-1. Returns order id (string)."""
+        """SL-M SELL (protective stop-loss) with GTT validity so open positions
+        never sit unprotected overnight. type=3, side=-1, validity='GTT'.
+        Returns order id (string). Raises FyersError on rejection or non-GTT validity."""
         from broker import align_tick
-        validity = validate_kwargs.pop("validity", "DAY")
+        validity = validate_kwargs.pop("validity", "GTT")
         offline_order = bool(validate_kwargs.pop("offline_order", False))
+        overnight_position = bool(validate_kwargs.pop("overnight_position", True))
+        has_next_day_rearm = bool(validate_kwargs.pop("has_next_day_rearm", False))
         now = _resolve_now(self, validate_kwargs.pop("now", None))
         violations = validate_order(
             symbol,
@@ -374,6 +454,8 @@ class FyersClient:
             validity,
             allow_t2t=allow_t2t,
             is_stop=True,
+            overnight_position=overnight_position,
+            has_next_day_rearm=has_next_day_rearm,
             offline_order=offline_order,
             order_tag=order_tag,
             now=now,
@@ -385,6 +467,11 @@ class FyersClient:
             symbol=symbol,
             allow_t2t=allow_t2t,
         )
+        if str(validity or "").upper().strip() != "GTT":
+            raise FyersError(
+                f"sell-stop {symbol} refused: validity={validity!r} must be 'GTT' "
+                f"(never silently downgrade protective stop to DAY)"
+            )
         if is_t2t_symbol(symbol) and not allow_t2t:
             raise FyersError(
                 f"sell-stop {symbol} refused: {nse(symbol)} is a T2T/BE-series delivery-only stock "
@@ -393,7 +480,7 @@ class FyersClient:
         data = {
             "symbol": nse(symbol), "qty": int(qty), "type": 3, "side": -1,
             "productType": product, "limitPrice": 0, "stopPrice": align_tick(trigger),
-            "validity": validity, "offlineOrder": offline_order, "orderTag": str(order_tag)[:20],
+            "validity": "GTT", "offlineOrder": offline_order, "orderTag": str(order_tag)[:20],
         }
         return _order_id(self.fy.place_order(data), f"sell-stop {symbol}")
 
@@ -448,12 +535,22 @@ class FyersClient:
         symbol="NSE:MODIFY-EQ",
         side="SELL",
         product="CNC",
-        validity="DAY",
+        validity="GTT",
         order_tag="cupbot",
         allow_t2t=False,
         **validate_kwargs,
     ):
-        """Fyers v3 modify needs the order type alongside the id. For SL-M keep limitPrice 0."""
+        """Fyers v3 modify_order (PATCH /orders/sync). For SL-M keep limitPrice 0.
+
+        NOTE on GTT modify support: Fyers v3 does NOT support ``modify_order`` on a GTT
+        order identically to a regular DAY order — GTT orders in fyers_apiv3 use a
+        separate endpoint (``PATCH /gtt/orders/sync`` via ``modify_gtt_order``) with a
+        different schema requiring ``orderInfo.leg1.{price, triggerPrice, qty}``.
+        When ``modify_order`` is rejected on a GTT stop, callers (``LiveBroker.modify_stop``,
+        ``LiveBroker.modify_stop_qty``, ``replace_sell_stop``) MUST replace-then-cancel
+        (place the replacement GTT stop BEFORE cancelling the old stop) so there is
+        never a window without a protective stop.
+        """
         from broker import align_tick
         from scripts.exchange_constraints import get_lot_size
 
@@ -470,6 +567,9 @@ class FyersClient:
         else:
             price_to_check = 0.0
             is_stop = False
+
+        overnight_position = bool(validate_kwargs.pop("overnight_position", is_stop))
+        has_next_day_rearm = bool(validate_kwargs.pop("has_next_day_rearm", not is_stop))
 
         if qty is not None:
             qty_to_check = qty
@@ -488,6 +588,8 @@ class FyersClient:
             validity,
             allow_t2t=allow_t2t,
             is_stop=is_stop,
+            overnight_position=overnight_position,
+            has_next_day_rearm=has_next_day_rearm,
             offline_order=offline_order,
             order_tag=order_tag,
             now=now,
@@ -499,6 +601,11 @@ class FyersClient:
             symbol=symbol,
             allow_t2t=allow_t2t,
         )
+        if is_stop and str(validity or "").upper().strip() != "GTT":
+            raise FyersError(
+                f"modify {order_id} refused: validity={validity!r} must be 'GTT' "
+                f"(never silently downgrade protective stop to DAY)"
+            )
         aligned_limit = align_tick(limit_price) if limit_price else 0.0
         data = {"id": str(order_id), "type": int(order_type), "limitPrice": aligned_limit}
         if stop_price is not None:
@@ -507,9 +614,129 @@ class FyersClient:
             data["qty"] = int(qty)
         return _ok(self.fy.modify_order(data), f"modify {order_id}")
 
+    def modify_gtt_order(
+        self,
+        order_id,
+        trigger,
+        qty,
+        price=0,
+        symbol="NSE:MODIFY-EQ",
+        side="SELL",
+        product="CNC",
+        validity="GTT",
+        order_tag="cupbot",
+        allow_t2t=False,
+        **validate_kwargs,
+    ):
+        """Fyers v3 GTT modify (PATCH /gtt/orders/sync).
+
+        Unlike ``modify_order`` (which takes flat ``stopPrice`` and optional ``qty``),
+        Fyers's ``modify_gtt_order`` requires ``orderInfo.leg1.{price, triggerPrice, qty}``.
+        Applies ``align_tick()`` to every price and refuses non-GTT validity.
+        """
+        from broker import align_tick
+
+        offline_order = bool(validate_kwargs.pop("offline_order", False))
+        overnight_position = bool(validate_kwargs.pop("overnight_position", True))
+        has_next_day_rearm = bool(validate_kwargs.pop("has_next_day_rearm", False))
+        now = _resolve_now(self, validate_kwargs.pop("now", None))
+        violations = validate_order(
+            symbol,
+            side,
+            qty,
+            trigger,
+            product,
+            validity,
+            allow_t2t=allow_t2t,
+            is_stop=True,
+            overnight_position=overnight_position,
+            has_next_day_rearm=has_next_day_rearm,
+            offline_order=offline_order,
+            order_tag=order_tag,
+            now=now,
+            **validate_kwargs,
+        )
+        self._enforce_preflight(
+            violations,
+            what=f"modify-gtt {order_id}",
+            symbol=symbol,
+            allow_t2t=allow_t2t,
+        )
+        if str(validity or "").upper().strip() != "GTT":
+            raise FyersError(
+                f"modify-gtt {order_id} refused: validity={validity!r} must be 'GTT'"
+            )
+        aligned_price = align_tick(price) if price else 0
+        data = {
+            "id": str(order_id),
+            "orderInfo": {
+                "leg1": {
+                    "price": aligned_price,
+                    "triggerPrice": align_tick(trigger),
+                    "qty": int(qty),
+                }
+            },
+        }
+        return _ok(self.fy.modify_gtt_order(data), f"modify-gtt {order_id}")
+
+    def replace_sell_stop(
+        self,
+        order_id,
+        symbol,
+        qty,
+        trigger,
+        product="CNC",
+        order_tag="cupbot",
+        allow_t2t=False,
+        **validate_kwargs,
+    ):
+        """Replace a protective GTT sell-stop with zero unprotected window:
+        places the replacement GTT stop FIRST, and only cancels ``order_id``
+        after the replacement is confirmed resting. If cancelling the old stop
+        fails, rolls back the new stop and raises FyersError."""
+        from broker import align_tick
+        aligned = align_tick(trigger)
+        new_id = self.place_sell_stop(
+            symbol,
+            qty,
+            aligned,
+            product=product,
+            order_tag=order_tag,
+            allow_t2t=allow_t2t,
+            **validate_kwargs,
+        )
+        if not new_id:
+            raise FyersError(f"replace-sell-stop {symbol}: replacement returned no order id")
+        cancel_res = self.cancel_order(order_id)
+        cancel_ok = isinstance(cancel_res, dict) and (
+            str(cancel_res.get("s", "")).lower() == "ok"
+            or any(
+                m in str(cancel_res.get("message", "")).lower()
+                for m in ("not found", "no such", "does not exist", "not open", "already", "filled", "completed", "cancelled", "canceled")
+            )
+        )
+        if not cancel_ok:
+            try:
+                self.cancel_order(new_id)
+            except Exception:
+                pass
+            raise FyersError(
+                f"replace-sell-stop {symbol}: cancel of old stop {order_id} failed ({cancel_res!r}); "
+                f"rolled back replacement {new_id}"
+            )
+        return new_id
+
     def cancel_order(self, order_id):
         """Cancel is best-effort: an already-traded/cancelled order is not an error for us."""
         resp = self.fy.cancel_order({"id": str(order_id)})
         if isinstance(resp, dict) and resp.get("s") != "ok":
             print(f"[warn] cancel {order_id}: {resp.get('code')} {resp.get('message')}")
         return resp
+
+    def cancel_gtt_order(self, order_id):
+        """Cancel a GTT order on /gtt/orders/sync."""
+        resp = self.fy.cancel_gtt_order({"id": str(order_id)})
+        if isinstance(resp, dict) and resp.get("s") != "ok":
+            print(f"[warn] cancel-gtt {order_id}: {resp.get('code')} {resp.get('message')}")
+        return resp
+

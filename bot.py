@@ -126,10 +126,12 @@ class CupBot:
             self.day = blob.pop("_day", self.day)
             self.pos_state = blob
         if self.day != _today():
-            # DAY-validity stops died at the close. Forget the ids; the exit-pass
-            # self-heal (and, in LIVE, _reconcile_live) re-places them.
-            for ps in self.pos_state.values():
-                ps["sell_stop_id"] = None
+            # Legacy DAY-validity stops died at the close; GTT stops survive
+            # across sessions. Only clear a stored stop id if no live stop is
+            # resting at the broker for that symbol.
+            for sym, ps in self.pos_state.items():
+                if not self._has_live_stop(sym):
+                    ps["sell_stop_id"] = None
             self.day = _today()
             log("  new trading day — stored stop ids cleared, stops will be re-placed")
 
@@ -609,7 +611,21 @@ class CupBot:
             elif st.sl != prev_sl and ps.get("sell_stop_id"):
                 st.sl = align_tick(st.sl)
                 try:
-                    self._mutate(self.broker.modify_stop, ps["sell_stop_id"], st.sl)
+                    import inspect
+                    sig = inspect.signature(self.broker.modify_stop)
+                    if "symbol" in sig.parameters or any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                    ):
+                        res = self._mutate(
+                            self.broker.modify_stop,
+                            ps["sell_stop_id"],
+                            st.sl,
+                            symbol=sym,
+                            qty=st.qty_remaining,
+                            order_tag=self.tag,
+                        )
+                    else:
+                        res = self._mutate(self.broker.modify_stop, ps["sell_stop_id"], st.sl)
                 except Exception as e:
                     # Alert BEFORE the state marks the stop missing — this is the
                     # gap the original flash-test branch had: a modify failure
@@ -621,6 +637,8 @@ class CupBot:
                     ps["sell_stop_id"] = None
                     self._save()
                 else:
+                    if isinstance(res, dict) and res.get("id"):
+                        ps["sell_stop_id"] = str(res["id"])
                     if self.verbose:
                         label = "breakeven" if prev_phase == "ACTIVE" else "trail"
                         log(f"  SL    {sym} {label}: SL {prev_sl} -> {st.sl} (high {st.highest})")

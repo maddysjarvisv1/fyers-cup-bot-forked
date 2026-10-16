@@ -18,6 +18,8 @@ import tempfile
 import types
 from datetime import datetime, timezone
 
+from broker import align_tick
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 MAX_WATCHLIST = 8
@@ -88,8 +90,8 @@ def _read_existing_watchlist(path: str) -> list[dict]:
             sym = (r.get("symbol") or "").strip().upper()
             if not sym:
                 raise ValueError(f"Missing symbol on line {idx} of {path}")
-            rim = float(r["rim"])
-            trigger = float(r["trigger"])
+            rim = align_tick(float(r["rim"]))
+            trigger = align_tick(float(r["trigger"]))
             qty = int(float(r["qty"]))
             rows.append({"symbol": sym, "rim": rim, "trigger": trigger, "qty": qty})
     return rows
@@ -109,8 +111,8 @@ def _read_screener_candidates(path: str) -> list[dict]:
             sym = (r.get("symbol") or "").strip().upper()
             if not sym:
                 raise ValueError(f"Missing symbol on line {idx} of {path}")
-            rim = float(r["ath"])
-            trigger = float(r["buy_price"])
+            rim = align_tick(float(r["ath"]))
+            trigger = align_tick(float(r["buy_price"]))
             qty = int(float(r["qty"]))
             cands.append({"symbol": sym, "rim": rim, "trigger": trigger, "qty": qty})
     return cands
@@ -120,7 +122,9 @@ def _build_watchlist_csv(rows: list[dict]) -> str:
     """Build full watchlist.csv content with header + every row newline-terminated."""
     lines = ["symbol,rim,trigger,qty\n"]
     for r in rows:
-        lines.append(f"{r['symbol']},{r['rim']},{r['trigger']},{r['qty']}\n")
+        rim = align_tick(float(r["rim"]))
+        trigger = align_tick(float(r["trigger"]))
+        lines.append(f"{r['symbol']},{rim},{trigger},{r['qty']}\n")
     return "".join(lines)
 
 

@@ -128,6 +128,7 @@ class FyersClient:
         """SL-M BUY (buy-stop). Fyers: type=3 (Stop/SL-M), side=1 (buy).
         order_tag -> Fyers orderTag (strategy identifier; the Algo-ID hook).
         Returns the broker order id (string). Raises FyersError on rejection."""
+        from broker import align_tick
         data = {
             "symbol": nse(symbol),
             "qty": int(qty),
@@ -135,7 +136,7 @@ class FyersClient:
             "side": 1,                # 1 = Buy
             "productType": product,   # CNC / INTRADAY / MARGIN
             "limitPrice": 0,
-            "stopPrice": float(trigger),
+            "stopPrice": align_tick(trigger),
             "validity": "DAY",
             "offlineOrder": False,
             "orderTag": str(order_tag)[:20],
@@ -147,19 +148,21 @@ class FyersClient:
         LTP crosses ``trigger`` -- no polling needed. Returns the RAW fyers
         response so a probe can inspect it; parse 's'/'id' from it.
         Not part of the bot's normal entry path (the bot uses place_buy_stop)."""
+        from broker import align_tick
         data = {
             "symbol": nse(symbol), "side": 1, "productType": product,
             "orderInfo": {"leg1": {"qty": int(qty), "price": 0,
-                                   "triggerPrice": float(trigger)}},
+                                   "triggerPrice": align_tick(trigger)}},
             "validity": validity,
         }
         return self.fy.place_gtt_order(data)
 
     def place_sell_stop(self, symbol, qty, trigger, product="CNC", order_tag="cupbot"):
         """SL-M SELL (stop-loss). type=3, side=-1. Returns order id (string)."""
+        from broker import align_tick
         data = {
             "symbol": nse(symbol), "qty": int(qty), "type": 3, "side": -1,
-            "productType": product, "limitPrice": 0, "stopPrice": float(trigger),
+            "productType": product, "limitPrice": 0, "stopPrice": align_tick(trigger),
             "validity": "DAY", "offlineOrder": False, "orderTag": str(order_tag)[:20],
         }
         return _order_id(self.fy.place_order(data), f"sell-stop {symbol}")
@@ -175,9 +178,10 @@ class FyersClient:
 
     def modify_order(self, order_id, stop_price=None, limit_price=0, qty=None, order_type=3):
         """Fyers v3 modify needs the order type alongside the id. For SL-M keep limitPrice 0."""
+        from broker import align_tick
         data = {"id": str(order_id), "type": int(order_type), "limitPrice": float(limit_price)}
         if stop_price is not None:
-            data["stopPrice"] = float(stop_price)
+            data["stopPrice"] = align_tick(stop_price)
         if qty is not None:
             data["qty"] = int(qty)
         return _ok(self.fy.modify_order(data), f"modify {order_id}")

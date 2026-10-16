@@ -21,7 +21,7 @@ import os
 from dataclasses import asdict
 from datetime import datetime, timezone, timedelta
 import cup_sl_engine as sl
-from broker import PaperBroker
+from broker import PaperBroker, align_tick
 
 NEAR_PCT = 0.01   # arm a buy-stop only within 1% of the rim
 IST = timezone(timedelta(hours=5, minutes=30))   # India has no DST
@@ -106,7 +106,7 @@ class CupBot:
         self.tracker = tracker            # optional Tracking.Tracker -> ledger writes
         self.capital_budget = capital_budget  # ₹ cap on total deployed cup notional
         # symbol -> (trigger, qty) so we can price a candidate's notional
-        self._wat = {str(w["symbol"]).upper(): (float(w["trigger"]), int(w["qty"]))
+        self._wat = {str(w["symbol"]).upper(): (align_tick(float(w["trigger"])), int(w["qty"]))
                      for w in watchlist}
         self.pos_state = {}                  # SYM -> {"state": {...}, "sell_stop_id": id}
         # Symbols whose entry buy-stop was placed this session but whose fill
@@ -192,6 +192,7 @@ class CupBot:
     # error somewhere in a broker double, or a future regression) must not be
     # silently accepted as success either, so it's checked explicitly here too.
     def _place_sell(self, sym, qty, trigger):
+        trigger = align_tick(trigger)
         try:
             sid = self.broker.place_sell_stop(sym, qty, trigger, order_tag=self.tag)
         except Exception as e:
@@ -201,6 +202,7 @@ class CupBot:
         return sid
 
     def _place_buy(self, sym, qty, trigger):
+        trigger = align_tick(trigger)
         try:
             sid = self.broker.place_buy_stop(sym, qty, trigger, order_tag=self.tag)
         except Exception as e:
@@ -282,6 +284,7 @@ class CupBot:
                 self._reconcile_qty(sym, p)   # partial-fill / drift resync
                 continue
             st = sl.PosState(entry=p["avg"], qty_total=p["qty"], qty_remaining=p["qty"])
+            st.sl = align_tick(st.sl)
             try:
                 sid = self._place_sell(sym, p["qty"], st.sl)
             except LiveOrderError as e:
@@ -343,6 +346,7 @@ class CupBot:
         st.qty_remaining = int(p["qty"])
         if st.qty_remaining > st.qty_total:
             st.qty_total = st.qty_remaining
+        st.sl = align_tick(st.sl)
         ps["state"] = asdict(st)
         self._save()   # resynced qty persisted first — a failure below can't lose it
         old_id = ps.get("sell_stop_id")
@@ -393,7 +397,7 @@ class CupBot:
         return d
 
     def _entry_one(self, w, have, prices):
-        sym, rim, trig, qty = w["symbol"], float(w["rim"]), float(w["trigger"]), int(w["qty"])
+        sym, rim, trig, qty = w["symbol"], float(w["rim"]), align_tick(float(w["trigger"])), int(w["qty"])
         if sym in have or sym in self.pos_state or sym in self._in_flight:
             return
         ltp = prices.get(sym)
@@ -447,6 +451,7 @@ class CupBot:
                 if sym in self.pos_state:
                     continue   # already reconciled (e.g. by _reconcile_live) — no duplicate
                 st = sl.PosState(entry=f["price"], qty_total=f["qty"], qty_remaining=f["qty"])
+                st.sl = align_tick(st.sl)
                 try:
                     sid = self._place_sell(sym, f["qty"], st.sl)
                 except LiveOrderError as e:
@@ -512,6 +517,7 @@ class CupBot:
                         log(f"  HEAL  {sym}: old stop {orphan} not confirmed cancelled — deferring re-place")
                     continue
                 st0 = sl.PosState(**ps["state"])
+                st0.sl = align_tick(st0.sl)
                 try:
                     sid = self._place_sell(sym, st0.qty_remaining, st0.sl)
                 except LiveOrderError as e:
@@ -528,6 +534,8 @@ class CupBot:
             prev_sl, prev_phase = st.sl, st.phase
             prev_state = dict(ps["state"])
             st, actions = sl.step(st, ltp)
+            if st.sl != prev_sl:
+                st.sl = align_tick(st.sl)
 
             # --- engine says the stop level was breached -----------------------------
             exits = [a for a in actions if a[0] == "exit"]
@@ -557,6 +565,7 @@ class CupBot:
             if booked:
                 q, px = int(booked[0][1]), booked[0][2]
                 keep = int(st.qty_remaining)
+                st.sl = align_tick(st.sl)
                 # Persist the engine's mutation before the broker call. This is
                 # safe ONLY because _reconcile_live's qty-drift resync (LIVE) will
                 # correct any mismatch against the broker's real position on the
@@ -598,6 +607,7 @@ class CupBot:
 
             # --- breakeven / trail ----------------------------------------------------
             elif st.sl != prev_sl and ps.get("sell_stop_id"):
+                st.sl = align_tick(st.sl)
                 try:
                     self._mutate(self.broker.modify_stop, ps["sell_stop_id"], st.sl)
                 except Exception as e:

@@ -83,7 +83,7 @@ def test_no_trailing_newline_handled_correctly(tmp_path):
     loaded = run.load_watchlist(str(wl_path))
     assert loaded == [
         {"symbol": "LALPATHLAB", "rim": 2045.0, "trigger": 2126.8, "qty": 5},
-        {"symbol": "NAZARA", "rim": 419.5, "trigger": 436.28, "qty": 28},
+        {"symbol": "NAZARA", "rim": 419.5, "trigger": 436.3, "qty": 28},
     ]
 
     # Verify backup was created with original no-trailing-newline content
@@ -130,14 +130,15 @@ def test_budget_refusal_and_arithmetic_reported(tmp_path, capsys):
     cand_path = tmp_path / "nse_screener_candidates.csv"
     env_path = tmp_path / ".env"
 
-    # Existing notional: LALPATHLAB (2126.8 * 5 = 10634.0) + NAZARA (436.28 * 28 = 12215.84) = 22849.84
+    # Existing notional (after tick-align 436.28 -> 436.3):
+    # LALPATHLAB (2126.8 * 5 = 10634.0) + NAZARA (436.3 * 28 = 12216.40) = 22850.40
     wl_path.write_text(
         "symbol,rim,trigger,qty\n"
         "LALPATHLAB,2045.0,2126.8,5\n"
         "NAZARA,419.5,436.28,28\n",
         encoding="utf-8",
     )
-    # Candidate BIGCO: trigger=1000.0 * qty=30 = 30000.0 -> 22849.84 + 30000.00 = 52849.84 > 50000
+    # Candidate BIGCO: trigger=1000.0 * qty=30 = 30000.0 -> 22850.40 + 30000.00 = 52850.40 > 50000
     cand_path.write_text(
         CANDIDATES_HEADER + _cand_row("BIGCO", 961.54, 1000.0, 30),
         encoding="utf-8",
@@ -155,11 +156,11 @@ def test_budget_refusal_and_arithmetic_reported(tmp_path, capsys):
     assert len(res["skipped"]) == 1
     assert res["skipped"][0]["symbol"] == "BIGCO"
     reason = res["skipped"][0]["reason"]
-    assert "22849.84" in reason
+    assert "22850.40" in reason
     assert "30000.00" in reason
-    assert "52849.84" in reason
+    assert "52850.40" in reason
     assert "50000.00" in reason
-    assert "52849.84" in out
+    assert "52850.40" in out
 
     loaded = run.load_watchlist(str(wl_path))
     assert [r["symbol"] for r in loaded] == ["LALPATHLAB", "NAZARA"]

@@ -23,6 +23,8 @@ import datetime
 import pandas as pd
 import yfinance as yf
 
+from broker import align_tick
+
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 HERE = os.path.dirname(os.path.abspath(__file__))
 CAND = os.path.join(HERE, "nse_screener_candidates.csv")
@@ -80,10 +82,11 @@ def screen_symbol(sym):
             return None  # ATH too recent — not a cup setup
         cur = float(h["Close"].iloc[-1])
         pct = (cur - ath) / ath * 100
-        buy = round(ath * 1.04, 2)
+        buy = align_tick(ath * 1.04)
+        sl = align_tick(buy * (1 - SL_PCT))
         return {
             "symbol": sym, "ath": round(ath, 2), "ath_date": str(adate),
-            "buy_price": buy, "sl_price": round(buy * (1 - SL_PCT), 2),
+            "buy_price": buy, "sl_price": sl,
             "qty": calc_qty(buy), "capital": round(buy * calc_qty(buy), 2),
             "current": round(cur, 2), "pct_from_ath": round(pct, 2),
         }

@@ -17,8 +17,36 @@ import os
 import json
 import time
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 
 IST = timezone(timedelta(hours=5, minutes=30))   # India has no DST
+
+_DEFAULT_TICK_SIZE = 0.05
+TICK_SIZE = float(os.getenv("TICK_SIZE", str(_DEFAULT_TICK_SIZE)))
+
+
+def align_tick(price: float, tick: float | None = None) -> float:
+    """Round ``price`` to the nearest valid exchange tick (default NSE equity 0.05).
+
+    Overridable via explicit ``tick`` argument, ``broker.TICK_SIZE`` module
+    constant, or the ``TICK_SIZE`` environment variable.
+    """
+    if tick is None:
+        if TICK_SIZE != _DEFAULT_TICK_SIZE:
+            tick = TICK_SIZE
+        else:
+            env_tick = os.getenv("TICK_SIZE")
+            tick = float(env_tick) if env_tick else TICK_SIZE
+    t = Decimal(str(tick))
+    if t <= 0:
+        return float(price)
+    d = Decimal(str(float(price)))
+    steps = (d / t).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return float(steps * t)
+
+
+align_to_tick = align_tick
+round_to_tick = align_tick
 
 
 def _now():
@@ -63,22 +91,23 @@ class PaperBroker:
         oid = self._oid()
         self.s["orders"].append({
             "id": oid, "symbol": symbol.upper(), "qty": int(qty),
-            "side": side, "type": "SL-M", "trigger": float(trigger),
+            "side": side, "type": "SL-M", "trigger": align_tick(trigger),
             "tag": order_tag, "status": "pending", "placed_at": _now(),
         })
         self._save()
         return oid
 
     def place_buy_stop(self, symbol, qty, trigger, order_tag="cupbot"):
-        return self._place_stop(symbol, qty, trigger, "BUY", order_tag)
+        return self._place_stop(symbol, qty, align_tick(trigger), "BUY", order_tag)
 
     def place_sell_stop(self, symbol, qty, trigger, order_tag="cupbot"):
-        return self._place_stop(symbol, qty, trigger, "SELL", order_tag)
+        return self._place_stop(symbol, qty, align_tick(trigger), "SELL", order_tag)
 
     def modify_stop(self, order_id, new_trigger):
+        aligned = align_tick(new_trigger)
         for o in self.s["orders"]:
             if o["id"] == order_id and o["status"] == "pending":
-                o["trigger"] = float(new_trigger)
+                o["trigger"] = aligned
                 o["modified_at"] = _now()
         self._save()
 
@@ -86,10 +115,11 @@ class PaperBroker:
         """Shrink a resting stop's quantity and reset its trigger in one step.
         symbol/order_tag accepted (unused) for interface parity with LiveBroker,
         whose fallback path needs them to re-place after a cancel."""
+        aligned = align_tick(new_trigger)
         for o in self.s["orders"]:
             if o["id"] == order_id and o["status"] == "pending":
                 o["qty"] = int(new_qty)
-                o["trigger"] = float(new_trigger)
+                o["trigger"] = aligned
                 o["modified_at"] = _now()
         self._save()
 
@@ -272,17 +302,17 @@ class LiveBroker:
 
     # ---- order placement ----
     def place_buy_stop(self, symbol, qty, trigger, order_tag="cupbot"):
-        oid = self.c.place_buy_stop(symbol, qty, trigger, order_tag=order_tag)
+        oid = self.c.place_buy_stop(symbol, qty, align_tick(trigger), order_tag=order_tag)
         self._invalidate()
         return self._remember(oid)
 
     def place_sell_stop(self, symbol, qty, trigger, order_tag="cupbot"):
-        oid = self.c.place_sell_stop(symbol, qty, trigger, order_tag=order_tag)
+        oid = self.c.place_sell_stop(symbol, qty, align_tick(trigger), order_tag=order_tag)
         self._invalidate()
         return self._remember(oid)
 
     def modify_stop(self, order_id, new_trigger):
-        r = self.c.modify_order(order_id, stop_price=float(new_trigger))
+        r = self.c.modify_order(order_id, stop_price=align_tick(new_trigger))
         self._invalidate()
         return r
 
@@ -300,8 +330,9 @@ class LiveBroker:
         order id under "id" so the caller can update its stored sell_stop_id —
         the id changes on this path, unlike the atomic-modify path.
         """
+        aligned_trigger = align_tick(new_trigger)
         try:
-            r = self.c.modify_order(order_id, stop_price=float(new_trigger), qty=int(new_qty))
+            r = self.c.modify_order(order_id, stop_price=aligned_trigger, qty=int(new_qty))
             self._invalidate()
             return r
         except Exception as e:
@@ -318,7 +349,7 @@ class LiveBroker:
             # of one that may still be resting; let the caller's self-heal retry
             raise RuntimeError(f"cancel of {order_id} unconfirmed during qty-shrink "
                                 f"({cancel_res!r}); refusing to place a second stop")
-        new_id = self.place_sell_stop(symbol, new_qty, new_trigger, order_tag=order_tag or self.tag)
+        new_id = self.place_sell_stop(symbol, new_qty, aligned_trigger, order_tag=order_tag or self.tag)
         return {"s": "ok", "id": new_id}
 
     def cancel(self, order_id):

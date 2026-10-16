@@ -134,7 +134,16 @@ def _acquire_single_instance(lock_path="run.lock"):
     return fh
 
 
+def _configure_stdout():
+    """Force line-buffered stdout even when redirected to a non-tty log file."""
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except AttributeError:
+        pass
+
+
 def main():
+    _configure_stdout()
     _lock_fh = _acquire_single_instance()   # single-instance guard: no parallel bots
     cfg = load_env()
     mode = env("MODE", "paper").lower()
@@ -187,7 +196,7 @@ def main():
                     npos = len(broker.positions())
                     norders = len(broker.open_orders())
                     print(f"[{datetime.now(IST):%H:%M:%S}] cycle ok | quotes {len(prices)} | "
-                          f"open orders {norders} | positions {npos}")
+                          f"open orders {norders} | positions {npos}", flush=True)
                 except Exception as e:
                     print(f"cycle error: {e}")
                     if alerts:

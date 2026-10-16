@@ -955,7 +955,7 @@ def test_preflight_happy_path_valid_orders_pass_untouched():
     """Valid orders pass untouched with no regression on the happy path."""
     c = _mock_client()
 
-    # Normal aligned CNC BUY stop (NAZARA 436.30 x 28) -> GTT validity
+    # Normal aligned CNC BUY stop (NAZARA 436.30 x 28)
     buy_id = c.place_buy_stop("NAZARA", 28, 436.30, product="CNC", order_tag="cupbot")
     assert buy_id == "ORD-101"
     assert c.warnings == []
@@ -968,12 +968,12 @@ def test_preflight_happy_path_valid_orders_pass_untouched():
         "productType": "CNC",
         "limitPrice": 0,
         "stopPrice": 436.30,
-        "validity": "GTT",
+        "validity": "DAY",
         "offlineOrder": False,
         "orderTag": "cupbot",
     }
 
-    # Normal aligned CNC SELL stop (NAZARA 410.10 x 28) -> GTT validity
+    # Normal aligned CNC SELL stop (NAZARA 410.10 x 28)
     sell_id = c.place_sell_stop("NAZARA", 28, 410.10, product="CNC", order_tag="cupbot")
     assert sell_id == "ORD-101"
     assert c.warnings == []
@@ -986,7 +986,7 @@ def test_preflight_happy_path_valid_orders_pass_untouched():
         "productType": "CNC",
         "limitPrice": 0,
         "stopPrice": 410.10,
-        "validity": "GTT",
+        "validity": "DAY",
         "offlineOrder": False,
         "orderTag": "cupbot",
     }

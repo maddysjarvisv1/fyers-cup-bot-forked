@@ -69,10 +69,10 @@ class PaperBroker:
         self.s = json.load(open(state_path))
         self.s.setdefault("day", _today())
         if self.s["day"] != _today():
-            # New session: DAY-validity stops would have been cancelled by the exchange;
-            # GTT stops survive across sessions.
+            # New session: DAY-validity stops would have been cancelled by the exchange.
+            # Keep positions, cash, trades; expire resting orders.
             for o in self.s["orders"]:
-                if o["status"] == "pending" and str(o.get("validity", "DAY")).upper() != "GTT":
+                if o["status"] == "pending":
                     o["status"] = "expired"
                     o["expired_at"] = _now()
             self.s["day"] = _today()
@@ -87,38 +87,34 @@ class PaperBroker:
         return oid
 
     # ---- order placement (return order id) ----
-    def _place_stop(self, symbol, qty, trigger, side, order_tag="cupbot", validity="GTT"):
-        if str(validity or "").upper().strip() != "GTT":
-            raise ValueError(f"stop validity must be 'GTT', got {validity!r}")
+    def _place_stop(self, symbol, qty, trigger, side, order_tag="cupbot"):
         oid = self._oid()
         self.s["orders"].append({
             "id": oid, "symbol": symbol.upper(), "qty": int(qty),
             "side": side, "type": "SL-M", "trigger": align_tick(trigger),
-            "validity": "GTT", "tag": order_tag, "status": "pending", "placed_at": _now(),
+            "tag": order_tag, "status": "pending", "placed_at": _now(),
         })
         self._save()
         return oid
 
     def place_buy_stop(self, symbol, qty, trigger, order_tag="cupbot"):
-        return self._place_stop(symbol, qty, align_tick(trigger), "BUY", order_tag, validity="GTT")
+        return self._place_stop(symbol, qty, align_tick(trigger), "BUY", order_tag)
 
     def place_sell_stop(self, symbol, qty, trigger, order_tag="cupbot"):
-        return self._place_stop(symbol, qty, align_tick(trigger), "SELL", order_tag, validity="GTT")
+        return self._place_stop(symbol, qty, align_tick(trigger), "SELL", order_tag)
 
-    def modify_stop(self, order_id, new_trigger, symbol=None, qty=None, order_tag=None):
+    def modify_stop(self, order_id, new_trigger):
         aligned = align_tick(new_trigger)
         for o in self.s["orders"]:
             if o["id"] == order_id and o["status"] == "pending":
                 o["trigger"] = aligned
-                if qty is not None:
-                    o["qty"] = int(qty)
                 o["modified_at"] = _now()
         self._save()
 
     def modify_stop_qty(self, order_id, new_qty, new_trigger, symbol=None, order_tag=None):
         """Shrink a resting stop's quantity and reset its trigger in one step.
         symbol/order_tag accepted (unused) for interface parity with LiveBroker,
-        whose fallback path needs them to re-place."""
+        whose fallback path needs them to re-place after a cancel."""
         aligned = align_tick(new_trigger)
         for o in self.s["orders"]:
             if o["id"] == order_id and o["status"] == "pending":
@@ -224,14 +220,6 @@ class LiveBroker:
     The orderbook is fetched at most once every ORDERBOOK_TTL seconds and is
     invalidated immediately after any order write, so a cycle that touches N
     symbols costs one API call instead of N (Fyers rate limits are per-second).
-
-    GTT modify vs cancel+replace:
-    Fyers v3 does NOT support ``modify_order`` (PATCH /orders/sync) on a GTT order
-    identically to a DAY order (GTT orders in fyers_apiv3 use PATCH /gtt/orders/sync
-    with mandatory ``orderInfo.leg1.{price, triggerPrice, qty}``). When ``modify_order``
-    is rejected/unsupported on a GTT stop, both ``modify_stop`` and ``modify_stop_qty``
-    replace-then-cancel: the replacement GTT stop is placed FIRST and confirmed before
-    the old stop is cancelled, so there is NEVER a window without a protective stop.
     """
 
     # Fyers v3 order status codes: 1=Cancelled 2=Traded/Filled 4=Transit 5=Rejected 6=Pending
@@ -245,19 +233,16 @@ class LiveBroker:
         self.c = client
         self.tag = str(tag)[:20]
         self.state_path = state_path
-        self.s = {"day": _today(), "seen": [], "ours": [], "stops": {}}
+        self.s = {"day": _today(), "seen": [], "ours": []}
         if os.path.exists(state_path):
             try:
                 self.s = json.load(open(state_path))
             except Exception:
                 pass
+        if self.s.get("day") != _today():
+            self.s = {"day": _today(), "seen": [], "ours": []}
         self.s.setdefault("seen", [])
         self.s.setdefault("ours", [])
-        self.s.setdefault("stops", {})
-        if self.s.get("day") != _today():
-            # GTT stops survive overnight across sessions — preserve "ours" and "stops"
-            # so prior-day GTT order ids remain recognized and modifiable.
-            self.s["day"] = _today()
         self._ob = None
         self._ob_at = 0.0
         self._warned_untagged = False
@@ -266,17 +251,13 @@ class LiveBroker:
     def _save(self):
         json.dump(self.s, open(self.state_path, "w"), indent=2)
 
-    def _remember(self, order_id, meta=None):
+    def _remember(self, order_id):
         """Track ids we placed, so reconciliation still works if Fyers does not
         echo orderTag back in the orderbook."""
-        oid = str(order_id or "")
-        if not oid:
-            raise RuntimeError("broker returned empty order id")
-        if oid not in self.s["ours"]:
+        oid = str(order_id)
+        if oid and oid not in self.s["ours"]:
             self.s["ours"].append(oid)
-        if meta is not None:
-            self.s.setdefault("stops", {})[oid] = dict(meta)
-        self._save()
+            self._save()
         return oid
 
     # ---- orderbook cache ----
@@ -319,209 +300,61 @@ class LiveBroker:
         tag = o.get("orderTag") or o.get("orderTag1") or ""
         return bool(self.tag) and self.tag in str(tag)
 
-    # ---- order placement (GTT stops) ----
+    # ---- order placement ----
     def place_buy_stop(self, symbol, qty, trigger, order_tag="cupbot"):
-        aligned = align_tick(trigger)
-        oid = self.c.place_buy_stop(symbol, qty, aligned, order_tag=order_tag)
+        oid = self.c.place_buy_stop(symbol, qty, align_tick(trigger), order_tag=order_tag)
         self._invalidate()
-        return self._remember(
-            oid,
-            {
-                "symbol": self._sym(symbol),
-                "qty": int(qty),
-                "trigger": aligned,
-                "side": "BUY",
-                "order_tag": str(order_tag or self.tag)[:20],
-                "validity": "GTT",
-            },
-        )
+        return self._remember(oid)
 
     def place_sell_stop(self, symbol, qty, trigger, order_tag="cupbot"):
-        aligned = align_tick(trigger)
-        oid = self.c.place_sell_stop(symbol, qty, aligned, order_tag=order_tag)
+        oid = self.c.place_sell_stop(symbol, qty, align_tick(trigger), order_tag=order_tag)
         self._invalidate()
-        return self._remember(
-            oid,
-            {
-                "symbol": self._sym(symbol),
-                "qty": int(qty),
-                "trigger": aligned,
-                "side": "SELL",
-                "order_tag": str(order_tag or self.tag)[:20],
-                "validity": "GTT",
-            },
-        )
+        return self._remember(oid)
 
-    def _resolve_stop_meta(self, order_id, symbol=None, qty=None, order_tag=None):
-        """Resolve (symbol, qty, order_tag) for a resting stop so a cancel+replace
-        fallback can place the replacement stop before cancelling ``order_id``."""
-        oid = str(order_id or "")
-        stored = dict(self.s.get("stops", {}).get(oid) or {})
-        sym = self._sym(symbol) if symbol else stored.get("symbol")
-        resolved_qty = int(qty) if qty is not None else stored.get("qty")
-        resolved_tag = str(order_tag or stored.get("order_tag") or self.tag)[:20]
-
-        if not sym or not resolved_qty:
-            for o in self._orderbook():
-                if str(o.get("id") or "") == oid:
-                    if not sym:
-                        sym = self._sym(o.get("symbol"))
-                    if not resolved_qty:
-                        resolved_qty = self._int(o.get("qty"))
-                    if not order_tag and o.get("orderTag"):
-                        resolved_tag = str(o.get("orderTag"))[:20]
-                    break
-
-        if sym and not resolved_qty:
-            for p in self.positions():
-                if p.get("symbol") == sym and p.get("qty"):
-                    resolved_qty = int(p["qty"])
-                    break
-
-        return sym, resolved_qty, resolved_tag
-
-    @staticmethod
-    def _is_cancel_confirmed(cancel_res):
-        if not isinstance(cancel_res, dict):
-            return False
-        if str(cancel_res.get("s", "")).lower() == "ok":
-            return True
-        msg = str(cancel_res.get("message", "")).lower()
-        return any(
-            m in msg
-            for m in ("not found", "no such", "does not exist", "not open", "already", "filled", "completed", "cancelled", "canceled")
-        )
-
-    def _replace_stop(self, order_id, new_qty, new_trigger, symbol=None, order_tag=None):
-        """Replace a protective stop with ZERO unprotected window:
-        1. Place the replacement GTT stop FIRST and confirm ``new_id`` is resting.
-        2. Cancel the old stop ``order_id`` SECOND.
-        3. If cancelling ``order_id`` fails, roll back ``new_id`` so two stops are
-           never left stacked, while ``order_id`` remains resting, and RAISE.
-        """
-        aligned_trigger = align_tick(new_trigger)
-        sym, resolved_qty, resolved_tag = self._resolve_stop_meta(
-            order_id, symbol=symbol, qty=new_qty, order_tag=order_tag
-        )
-        if not sym or not resolved_qty or int(resolved_qty) <= 0:
-            raise RuntimeError(
-                f"cannot safely replace GTT stop {order_id}: missing symbol={sym!r} or qty={resolved_qty!r}"
-            )
-        # 1. Place the replacement GTT stop FIRST so the position is never unprotected
-        new_id = self.place_sell_stop(sym, int(resolved_qty), aligned_trigger, order_tag=resolved_tag)
-        if not new_id:
-            raise RuntimeError(f"replacement GTT stop for {sym} returned no order id")
-
-        # 2. Only once replacement is in place, cancel the old stop
-        cancel_res = self.c.cancel_order(order_id)
+    def modify_stop(self, order_id, new_trigger):
+        r = self.c.modify_order(order_id, stop_price=align_tick(new_trigger))
         self._invalidate()
-        if not self._is_cancel_confirmed(cancel_res):
-            # Roll back the newly placed stop so we do not stack two active stops
-            # while the uncancelled old stop remains resting.
-            try:
-                self.c.cancel_order(new_id)
-                self.s.get("stops", {}).pop(str(new_id), None)
-                self._invalidate()
-                self._save()
-            except Exception:
-                pass
-            raise RuntimeError(
-                f"cancel of {order_id} unconfirmed during GTT stop replace "
-                f"({cancel_res!r}); rolled back replacement {new_id}"
-            )
-        self.s.get("stops", {}).pop(str(order_id), None)
-        self._save()
-        return {"s": "ok", "id": new_id}
-
-    def replace_stop(self, order_id, new_trigger, new_qty=None, symbol=None, order_tag=None):
-        """Explicit replace-before-cancel entry point for a GTT protective stop."""
-        return self._replace_stop(
-            order_id,
-            new_qty=new_qty,
-            new_trigger=align_tick(new_trigger),
-            symbol=symbol,
-            order_tag=order_tag,
-        )
-
-    def modify_stop(self, order_id, new_trigger, symbol=None, qty=None, order_tag=None):
-        """Modify a resting protective stop's trigger price.
-
-        Tries in-place ``modify_order`` first (0 window). Because Fyers v3 does NOT
-        support ``modify_order`` on GTT orders identically to DAY orders, falls back
-        to ``_replace_stop`` (places replacement GTT stop BEFORE cancelling old stop,
-        also 0 window without a protective stop). Raises if neither path succeeds.
-        """
-        aligned_trigger = align_tick(new_trigger)
-        try:
-            r = self.c.modify_order(order_id, stop_price=aligned_trigger)
-            if not (isinstance(r, dict) and str(r.get("s", "")).lower() == "ok"):
-                raise RuntimeError(f"modify_order {order_id} returned {r!r}")
-            self._invalidate()
-            oid = str(order_id)
-            if oid in self.s.get("stops", {}):
-                self.s["stops"][oid]["trigger"] = aligned_trigger
-                self._save()
-            return r
-        except Exception as e:
-            sym, resolved_qty, resolved_tag = self._resolve_stop_meta(
-                order_id, symbol=symbol, qty=qty, order_tag=order_tag
-            )
-            if not sym or not resolved_qty:
-                raise
-            print(f"[warn] GTT stop modify rejected ({e}); "
-                  f"replacing-then-cancelling for {sym} (no unprotected window)")
-            return self._replace_stop(
-                order_id,
-                new_qty=resolved_qty,
-                new_trigger=aligned_trigger,
-                symbol=sym,
-                order_tag=resolved_tag,
-            )
+        return r
 
     def modify_stop_qty(self, order_id, new_qty, new_trigger, symbol=None, order_tag=None):
-        """Shrink/update a resting stop's qty and trigger together.
+        """Shrink a resting stop's qty and trigger together, so the remainder is
+        never naked and never doubled-up during a partial book.
 
-        Tries a single combined in-place modify first (0 window). Because Fyers v3
-        does NOT support ``modify_order`` on GTT orders identically to DAY orders,
-        falls back to ``_replace_stop``: places the replacement GTT stop FIRST, and
-        only cancels ``order_id`` once the replacement is confirmed resting (never
-        leaving a window with no protective stop). Returns a dict carrying the new
-        order id under "id" on the replacement path.
+        Tries a single combined modify first (best case: no window at all where
+        the position is unprotected). If Fyers rejects a combined qty+stopPrice
+        modify on an SL-M — unverified either way; test_live_order.py is what
+        proves it — falls back to cancel-then-replace, in that order and only
+        once the cancel is CONFIRMED (never place-then-cancel: that would rest
+        two SELL-stops on the same qty at once, i.e. an oversell/short risk if
+        both fill). Returns a dict; on the fallback path it carries the new
+        order id under "id" so the caller can update its stored sell_stop_id —
+        the id changes on this path, unlike the atomic-modify path.
         """
         aligned_trigger = align_tick(new_trigger)
         try:
             r = self.c.modify_order(order_id, stop_price=aligned_trigger, qty=int(new_qty))
-            if not (isinstance(r, dict) and str(r.get("s", "")).lower() == "ok"):
-                raise RuntimeError(f"modify_order {order_id} returned {r!r}")
             self._invalidate()
-            oid = str(order_id)
-            if oid in self.s.get("stops", {}):
-                self.s["stops"][oid]["qty"] = int(new_qty)
-                self.s["stops"][oid]["trigger"] = aligned_trigger
-                self._save()
             return r
         except Exception as e:
-            sym, _, resolved_tag = self._resolve_stop_meta(
-                order_id, symbol=symbol, qty=new_qty, order_tag=order_tag
-            )
-            if not sym:
+            if not symbol:
+                # caller didn't pass what the fallback needs — surface the
+                # original failure rather than silently doing nothing
                 raise
             print(f"[warn] combined qty+trigger modify rejected ({e}); "
-                  f"replacing-then-cancelling for {sym} (no unprotected window)")
-            return self._replace_stop(
-                order_id,
-                new_qty=int(new_qty),
-                new_trigger=aligned_trigger,
-                symbol=sym,
-                order_tag=resolved_tag,
-            )
+                  f"falling back to cancel-then-replace for {symbol}")
+        cancel_res = self.c.cancel_order(order_id)
+        self._invalidate()
+        if not (isinstance(cancel_res, dict) and str(cancel_res.get("s", "")).lower() == "ok"):
+            # cancel itself is unconfirmed — do NOT place a second stop on top
+            # of one that may still be resting; let the caller's self-heal retry
+            raise RuntimeError(f"cancel of {order_id} unconfirmed during qty-shrink "
+                                f"({cancel_res!r}); refusing to place a second stop")
+        new_id = self.place_sell_stop(symbol, new_qty, aligned_trigger, order_tag=order_tag or self.tag)
+        return {"s": "ok", "id": new_id}
 
     def cancel(self, order_id):
         r = self.c.cancel_order(order_id)
         self._invalidate()
-        if self._is_cancel_confirmed(r):
-            self.s.get("stops", {}).pop(str(order_id), None)
-            self._save()
         return r
 
     def market_sell(self, symbol, qty, price=None, order_tag=None):

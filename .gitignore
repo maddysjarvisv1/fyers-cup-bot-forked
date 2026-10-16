@@ -27,3 +27,7 @@ run.lock
 
 # intraday paper tracker runtime ledger
 intraday_paper/ledger.jsonl
+
+# graphify: keep the graph + report, regenerate the viz locally
+graphify-out/graph.html
+graphify-out/cache/

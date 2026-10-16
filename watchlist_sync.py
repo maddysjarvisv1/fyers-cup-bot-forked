@@ -153,6 +153,7 @@ def sync_watchlist(
     max_watchlist: int = MAX_WATCHLIST,
     capital_budget: float | int | None = None,
     env_path: str | None = None,
+    allow_t2t: bool = False,
 ) -> dict:
     """Sync qualifying candidates from nse_screener_candidates.csv into watchlist.csv.
 
@@ -177,12 +178,23 @@ def sync_watchlist(
     added: list[dict] = []
     skipped: list[dict] = []
 
+    from fyers_client import SYMBOL_OVERRIDES, T2T_SERIES_SUFFIXES
+
     for cand in candidates:
         sym = cand["symbol"].upper()
         rim = cand["rim"]
         trigger = cand["trigger"]
         qty = cand["qty"]
         cand_notional = trigger * qty
+
+        # Rule 0: T2T / -BE SERIES (delivery-only, no same-day SL execution)
+        plain_sym = sym.split(":")[-1].rsplit("-", 1)[0] if "-" in sym else sym.split(":")[-1]
+        if not allow_t2t and (plain_sym in SYMBOL_OVERRIDES or sym.endswith(T2T_SERIES_SUFFIXES)):
+            skipped.append({
+                "symbol": sym,
+                "reason": "T2T/BE-series symbol (delivery-only; no same-day SL execution)",
+            })
+            continue
 
         # Rule 1: DEDUPE (case-insensitive)
         if sym in seen_symbols:

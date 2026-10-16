@@ -22,8 +22,9 @@ def load_env(path=".env"):
 
 
 # Symbols that trade in NSE's "BE" (Trade-to-Trade) series use -BE, not -EQ.
-# NOTE: T2T stocks are delivery-only — no intraday square-off, so a same-day
-# stop-loss cannot execute (you can only sell after T+1 delivery). Trade with care.
+# T2T stocks are delivery-only — no intraday square-off, so a same-day
+# stop-loss cannot execute (you can only sell after T+1 delivery).
+# Enforced as a hard check in is_t2t_symbol() and stop-order placement methods.
 SYMBOL_OVERRIDES = {
     "BAFNAPH": "NSE:BAFNAPH-BE",
     "SANGINITA": "NSE:SANGINITA-BE",
@@ -32,6 +33,8 @@ SYMBOL_OVERRIDES = {
     "VIJIFIN": "NSE:VIJIFIN-BE",
     "WELINV": "NSE:WELINV-BE",
 }
+
+T2T_SERIES_SUFFIXES = ("-BE", "-BZ", "-SZ", "-T")
 
 
 def nse(symbol: str) -> str:
@@ -48,6 +51,18 @@ def plain(fyers_symbol: str) -> str:
     """Fyers symbol -> plain. NSE:SOTL-EQ -> SOTL; NSE:BAFNAPH-BE -> BAFNAPH."""
     s = fyers_symbol.split(":")[-1]
     return s.rsplit("-", 1)[0] if "-" in s else s
+
+
+def is_t2t_symbol(symbol: str) -> bool:
+    """Return True if ``symbol`` is in NSE's Trade-to-Trade (BE/BZ/SZ/T) series."""
+    if not symbol or not str(symbol).strip():
+        return False
+    raw = str(symbol).upper().strip()
+    p = plain(raw)
+    if p in SYMBOL_OVERRIDES:
+        return True
+    full = nse(raw)
+    return full.endswith(T2T_SERIES_SUFFIXES)
 
 
 class FyersError(RuntimeError):
@@ -124,11 +139,16 @@ class FyersClient:
         return self.fy.orderbook()
 
     # ---- order placement (REAL money — use deliberately) ----
-    def place_buy_stop(self, symbol, qty, trigger, product="CNC", order_tag="cupbot"):
+    def place_buy_stop(self, symbol, qty, trigger, product="CNC", order_tag="cupbot", allow_t2t=False):
         """SL-M BUY (buy-stop). Fyers: type=3 (Stop/SL-M), side=1 (buy).
         order_tag -> Fyers orderTag (strategy identifier; the Algo-ID hook).
         Returns the broker order id (string). Raises FyersError on rejection."""
         from broker import align_tick
+        if is_t2t_symbol(symbol) and not allow_t2t:
+            raise FyersError(
+                f"buy-stop {symbol} refused: {nse(symbol)} is a T2T/BE-series delivery-only stock "
+                f"(no intraday square-off; same-day SL cannot execute)"
+            )
         data = {
             "symbol": nse(symbol),
             "qty": int(qty),
@@ -143,12 +163,17 @@ class FyersClient:
         }
         return _order_id(self.fy.place_order(data), f"buy-stop {symbol}")
 
-    def place_buy_gtt(self, symbol, qty, trigger, product="CNC", validity="DAY", order_tag="cupbot"):
+    def place_buy_gtt(self, symbol, qty, trigger, product="CNC", validity="DAY", order_tag="cupbot", allow_t2t=False):
         """Good-till-triggered BUY (bracket entry). Fires on the EXCHANGE when
         LTP crosses ``trigger`` -- no polling needed. Returns the RAW fyers
         response so a probe can inspect it; parse 's'/'id' from it.
         Not part of the bot's normal entry path (the bot uses place_buy_stop)."""
         from broker import align_tick
+        if is_t2t_symbol(symbol) and not allow_t2t:
+            raise FyersError(
+                f"buy-gtt {symbol} refused: {nse(symbol)} is a T2T/BE-series delivery-only stock "
+                f"(no intraday square-off; same-day SL cannot execute)"
+            )
         data = {
             "symbol": nse(symbol), "side": 1, "productType": product,
             "orderInfo": {"leg1": {"qty": int(qty), "price": 0,
@@ -157,9 +182,14 @@ class FyersClient:
         }
         return self.fy.place_gtt_order(data)
 
-    def place_sell_stop(self, symbol, qty, trigger, product="CNC", order_tag="cupbot"):
+    def place_sell_stop(self, symbol, qty, trigger, product="CNC", order_tag="cupbot", allow_t2t=False):
         """SL-M SELL (stop-loss). type=3, side=-1. Returns order id (string)."""
         from broker import align_tick
+        if is_t2t_symbol(symbol) and not allow_t2t:
+            raise FyersError(
+                f"sell-stop {symbol} refused: {nse(symbol)} is a T2T/BE-series delivery-only stock "
+                f"(no intraday square-off; same-day SL cannot execute)"
+            )
         data = {
             "symbol": nse(symbol), "qty": int(qty), "type": 3, "side": -1,
             "productType": product, "limitPrice": 0, "stopPrice": align_tick(trigger),
@@ -179,7 +209,8 @@ class FyersClient:
     def modify_order(self, order_id, stop_price=None, limit_price=0, qty=None, order_type=3):
         """Fyers v3 modify needs the order type alongside the id. For SL-M keep limitPrice 0."""
         from broker import align_tick
-        data = {"id": str(order_id), "type": int(order_type), "limitPrice": float(limit_price)}
+        aligned_limit = align_tick(limit_price) if limit_price else 0.0
+        data = {"id": str(order_id), "type": int(order_type), "limitPrice": aligned_limit}
         if stop_price is not None:
             data["stopPrice"] = align_tick(stop_price)
         if qty is not None:

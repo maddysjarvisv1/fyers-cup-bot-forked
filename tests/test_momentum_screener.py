@@ -419,6 +419,121 @@ def test_offline_cli_fixture_scan_and_list(tmp_path, capsys):
     assert "SONACOMS" in out
 
 
+def test_scan_creates_nonexistent_nested_out_dir_and_writes_status_and_candidates(
+    monkeypatch, tmp_path, capsys
+):
+    """Regression for task-185: scan with a non-existent nested --out-dir creates parent
+    directories and writes both momentum_status.json and momentum_candidates.csv."""
+    out_dir = tmp_path / "does" / "not" / "exist" / "yet"
+    assert not out_dir.exists()
+
+    series = {
+        "SONACOMS": make_series(edits={120: {"h": 839.0, "c": 820.0}}),
+        "FLATCO": make_series(today=dict(FLAT)),
+    }
+    monkeypatch.setattr(
+        ms, "FyersClient", types.SimpleNamespace(from_files=lambda: FakeFyers(series=series))
+    )
+    monkeypatch.setattr(ms, "fetch_universe", lambda max_n=None: ["SONACOMS", "FLATCO"])
+    monkeypatch.setattr(ms, "resolve_capital_budget", lambda *a, **k: 50_000.0)
+
+    rc = ms.main([
+        "scan", "--asof", ASOF.isoformat(), "--min-ok", "2",
+        "--interval", "0", "--out-dir", str(out_dir),
+    ])
+    assert rc == 0
+
+    status_file = out_dir / "momentum_status.json"
+    cand_file = out_dir / "momentum_candidates.csv"
+    assert status_file.is_file()
+    assert cand_file.is_file()
+    assert list(out_dir.glob(".momentum_*.tmp")) == []
+
+    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert status["tool"] == "momentum_screener"
+    assert status["asof"] == ASOF.isoformat()
+    assert status["verdict"] == "OK"
+    assert status["verdict_reasons"] == []
+    assert status["exit_code"] == 0
+    assert status["universe"] == 2
+    assert status["attempted"] == 2
+    assert status["symbols_ok"] == 2
+    assert status["errors"] == 0
+    assert status["error_rate"] == 0.0
+    assert status["candidates"] == 1
+    assert status["outcomes"] == {"hit": 1, "no_volume_spike": 1}
+    assert status["candidates_path"] == str(cand_file)
+
+    cand_lines = cand_file.read_text(encoding="utf-8").splitlines()
+    assert len(cand_lines) == 2
+    assert cand_lines[0] == ",".join(ms.ROW_FIELDS)
+    assert cand_lines[1].startswith("SONACOMS,839.0,872.55,16,momentum,820.2,52.35,837.6,")
+
+    capsys.readouterr()
+    assert ms.main(["list", "--out-dir", str(out_dir)]) == 0
+    assert "1 momentum candidates" in capsys.readouterr().out
+
+    # Also verify _fail_setup writes status artifact when --out-dir does not exist yet
+    setup_fail_dir = tmp_path / "missing_parent" / "setup_fail"
+    assert not setup_fail_dir.exists()
+    rc_fail = ms.main([
+        "scan", "--asof", ASOF.isoformat(), "--out-dir", str(setup_fail_dir),
+        "--fixture", str(tmp_path / "no_such_fixture.json"),
+    ])
+    assert rc_fail == 2
+    fail_status = json.loads((setup_fail_dir / "momentum_status.json").read_text(encoding="utf-8"))
+    assert fail_status["verdict"] == "FAILED"
+    assert fail_status["exit_code"] == 2
+    assert fail_status["aborted"] is True
+
+
+def test_unwritable_out_dir_raises_clear_error(monkeypatch, tmp_path):
+    """Negative control for task-185: a read-only or unwritable target directory fails
+    loudly with a clear error message and is never swallowed."""
+    ro_dir = tmp_path / "readonly_dir"
+    ro_dir.mkdir()
+    ro_dir.chmod(0o555)
+    try:
+        with pytest.raises(PermissionError, match="not writable") as exc_info:
+            ms._atomic_write(str(ro_dir / "momentum_status.json"), "{}\n")
+        assert str(ro_dir) in str(exc_info.value)
+
+        nested_under_ro = ro_dir / "nested" / "sub"
+        series = {"SONACOMS": make_series(edits={120: {"h": 839.0, "c": 820.0}})}
+        with pytest.raises(PermissionError, match="not writable") as scan_exc:
+            ms.run_scan(
+                FakeFyers(series=series),
+                ["SONACOMS"],
+                ASOF,
+                capital_budget=50_000.0,
+                min_ok=1,
+                interval=0,
+                cand_path=str(nested_under_ro / "momentum_candidates.csv"),
+                status_path=str(nested_under_ro / "momentum_status.json"),
+            )
+        assert str(nested_under_ro) in str(scan_exc.value)
+        assert not nested_under_ro.exists()
+    finally:
+        ro_dir.chmod(0o755)
+
+    blocker_file = tmp_path / "file_not_a_dir"
+    blocker_file.write_text("occupied", encoding="utf-8")
+    monkeypatch.setattr(
+        ms,
+        "FyersClient",
+        types.SimpleNamespace(
+            from_files=lambda: FakeFyers(series={"FLATCO": make_series(today=dict(FLAT))})
+        ),
+    )
+    monkeypatch.setattr(ms, "fetch_universe", lambda max_n=None: ["FLATCO"])
+    monkeypatch.setattr(ms, "resolve_capital_budget", lambda *a, **k: 50_000.0)
+    with pytest.raises(NotADirectoryError, match="not a directory"):
+        ms.main([
+            "scan", "--asof", ASOF.isoformat(), "--min-ok", "1",
+            "--interval", "0", "--out-dir", str(blocker_file / "nested"),
+        ])
+
+
 def test_live_fyers_history_skipped_when_token_stale():
     """Any test requiring live Fyers market data must be explicitly skipped when token.json is stale."""
     if not so.token_is_today("token.json"):

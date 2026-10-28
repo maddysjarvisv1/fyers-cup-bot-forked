@@ -24,7 +24,7 @@ Take-profit ladder (in cup_sl_engine.py, unchanged):
 
 Usage:
   momentum_screener.py scan [max_symbols] [--asof YYYY-MM-DD] [--min-ok N] [--interval S] [--out-dir D] [--fixture PATH]
-  momentum_screener.py list
+  momentum_screener.py list [--out-dir D]
 Writes momentum_candidates.csv (watchlist rows; run.py loads it when MOMENTUM_WATCHLIST is set)
 and momentum_status.json (machine-readable verdict). Exit: 0 = OK/DEGRADED, 2 = FAILED.
 """
@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import errno
 import io
 import json
 import math
@@ -503,8 +504,36 @@ def judge(stats, *, min_ok=MIN_SYMBOLS_OK, aborted=False):
 
 # --- artifacts -----------------------------------------------------------------------
 def _atomic_write(path, text):
-    d = os.path.dirname(os.path.abspath(path)) or "."
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=".momentum_", suffix=".tmp")
+    target = os.path.abspath(path)
+    d = os.path.dirname(target) or "."
+    probe = d
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    if probe and os.path.exists(probe):
+        if not os.path.isdir(probe):
+            raise NotADirectoryError(
+                errno.ENOTDIR, f"Target directory path is not a directory: {d}", probe
+            )
+        st = os.stat(probe)
+        mode_unwritable = (st.st_mode & 0o222) == 0 or (
+            hasattr(os, "geteuid") and os.geteuid() == st.st_uid and (st.st_mode & 0o200) == 0
+        )
+        if not os.access(probe, os.W_OK | os.X_OK) or mode_unwritable:
+            raise PermissionError(
+                errno.EACCES, f"Target directory is not writable: {d}", probe
+            )
+    try:
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".momentum_", suffix=".tmp")
+    except OSError as exc:
+        raise type(exc)(
+            exc.errno,
+            f"Target directory is not writable ({d}): {exc.strerror or exc}",
+            exc.filename or d,
+        ) from exc
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(text)
@@ -628,7 +657,8 @@ def list_cands(path=CAND):
     if not os.path.exists(path):
         print("no momentum candidates yet — run: momentum_screener.py scan")
         return
-    rows = list(csv.DictReader(open(path)))
+    with open(path, encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
     print(f"{len(rows)} momentum candidates in {os.path.basename(path)}:")
     for r in rows[:15]:
         print(f"   {r['symbol']:<12} {r['high_kind']:<3} rim {r['rim']:>9} trig {r['trigger']:>9} "
@@ -645,10 +675,11 @@ def main(argv=None):
     sc.add_argument("--interval", type=float, default=REQ_INTERVAL)
     sc.add_argument("--out-dir", default=HERE)
     sc.add_argument("--fixture", default=None, help="offline fixture JSON path (no network/API calls)")
-    sub.add_parser("list")
+    lp = sub.add_parser("list")
+    lp.add_argument("--out-dir", default=None)
     a = ap.parse_args(argv)
     if a.cmd == "list":
-        list_cands()
+        list_cands(os.path.join(a.out_dir, "momentum_candidates.csv") if a.out_dir else CAND)
         return 0
 
     cand_path = os.path.join(a.out_dir, "momentum_candidates.csv")
@@ -660,7 +691,8 @@ def main(argv=None):
                            f"asof {asof} is today and the session has not closed (now {now:%H:%M} IST)")
     try:
         if a.fixture:
-            payload = json.load(open(a.fixture))
+            with open(a.fixture, encoding="utf-8") as f:
+                payload = json.load(f)
             client = _FixtureFyersClient(payload)
             symbols = list(payload.get("symbols") or payload.get("series", {}).keys())
             if a.max_symbols:

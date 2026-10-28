@@ -112,6 +112,8 @@ class CupBot:
         # symbol -> (trigger, qty) so we can price a candidate's notional
         self._wat = {str(w["symbol"]).upper(): (align_tick(float(w["trigger"])), int(w["qty"]))
                      for w in watchlist}
+        # symbol -> full watchlist row; momentum rows carry stop/time_stop_days/valid_until
+        self._rows = {str(w["symbol"]).upper(): w for w in watchlist}
         self.pos_state = {}                  # SYM -> {"state": {...}, "sell_stop_id": id}
         # Symbols whose entry buy-stop was placed this session but whose fill
         # has not yet produced a position. Intentionally NOT persisted — each
@@ -163,6 +165,22 @@ class CupBot:
 
     def _watch_syms(self):
         return {w["symbol"].upper() for w in self.watchlist}
+
+    def _new_pos_state(self, sym, entry, qty):
+        """Fresh PosState for a filled entry. Cup rows keep the engine default
+        (SL = entry*(1-SL_PCT), 6% below entry). Momentum rows use the row's
+        6%-below-entry stop (only if it sits below the fill, else the engine
+        default) and its time-stop."""
+        st = sl.PosState(entry=entry, qty_total=qty, qty_remaining=qty)
+        w = self._rows.get(str(sym).upper()) or {}
+        if w.get("kind") == "momentum":
+            stop = float(w.get("stop") or 0)
+            if 0 < stop < float(entry):
+                st.sl = stop
+            st.time_stop_days = int(w.get("time_stop_days") or 0)
+            st.entry_day = self.day
+        st.sl = align_tick(st.sl)
+        return st
 
     def _managed(self):
         """Symbols this bot may adopt/protect: the watchlist, anything with a
@@ -329,8 +347,7 @@ class CupBot:
             if sym in self.pos_state:
                 self._reconcile_qty(sym, p)   # partial-fill / drift resync
                 continue
-            st = sl.PosState(entry=p["avg"], qty_total=p["qty"], qty_remaining=p["qty"])
-            st.sl = align_tick(st.sl)
+            st = self._new_pos_state(sym, p["avg"], p["qty"])
             try:
                 sid = self._place_sell(sym, p["qty"], st.sl)
             except LiveOrderError as e:
@@ -465,6 +482,8 @@ class CupBot:
             return
         if (self.day, sym_u) in self._missed_today or (self.day, sym_u) in self._traded_today:
             return
+        if w.get("valid_until") and str(w["valid_until"]) < self.day:
+            return   # momentum row expired: a breakout level is only good for its next session
         ltp = prices.get(sym)
         if ltp is None:
             return
@@ -521,8 +540,7 @@ class CupBot:
             if f["reason"] == "ENTRY":
                 if sym in self.pos_state:
                     continue   # already reconciled (e.g. by _reconcile_live) — no duplicate
-                st = sl.PosState(entry=f["price"], qty_total=f["qty"], qty_remaining=f["qty"])
-                st.sl = align_tick(st.sl)
+                st = self._new_pos_state(sym, f["price"], f["qty"])
                 try:
                     sid = self._place_sell(sym, f["qty"], st.sl)
                 except LiveOrderError as e:
@@ -605,9 +623,37 @@ class CupBot:
             st = sl.PosState(**ps["state"])
             prev_sl, prev_phase = st.sl, st.phase
             prev_state = dict(ps["state"])
-            st, actions = sl.step(st, ltp)
+            st, actions = sl.step(st, ltp, today=self.day)
             if st.sl != prev_sl:
                 st.sl = align_tick(st.sl)
+
+            # --- momentum time-stop -------------------------------------------------
+            # The resting SELL stop sits BELOW ltp and will never fill on its own:
+            # cancel it (confirmed) first, then sell at market. Never sell while the old
+            # stop may still be resting (double-sell / short risk).
+            time_exits = [a for a in actions if a[0] == "time_exit"]
+            if time_exits:
+                qty = int(time_exits[0][1]) or int(pos.get("qty") or 0)
+                old_id = ps.get("sell_stop_id") or self._orphan_stops.get(sym)
+                if old_id and not self._cancel_tolerant(old_id, sym):
+                    log(f"  TIME  {sym}: stop {old_id} not confirmed cancelled — not selling this cycle")
+                    continue
+                ps["sell_stop_id"] = None
+                self._save()
+                try:
+                    self._mutate(self.broker.market_sell, sym, qty, ltp, order_tag=self.tag)
+                except Exception as e:
+                    # stop is gone and the sell failed: the HEAL block re-places the stop next cycle
+                    log(f"  ERROR {sym}: time-stop market-sell failed: {e} — stop self-heals next cycle")
+                    self._alert("error", sym, f"TIME-STOP SELL FAILED: {e}")
+                    continue
+                if self.verbose:
+                    log(f"  TIME  {sym}: {st.time_stop_days} sessions without breakeven — sold {qty} @ {ltp}")
+                self._alert("exit_", sym, ltp, qty, (ltp - st.entry) * qty)
+                self.pos_state.pop(sym, None)
+                self._gone_since.pop(sym, None)
+                self._save()
+                continue
 
             # --- engine says the stop level was breached -----------------------------
             exits = [a for a in actions if a[0] == "exit"]

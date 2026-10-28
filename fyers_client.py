@@ -134,6 +134,24 @@ def _order_id(resp, what="order"):
     return str(oid)
 
 
+def stop_limit_buy_payload(symbol, qty, trigger, limit, product="CNC", validity="DAY",
+                           offline_order=False, order_tag="cupbot"):
+    """Exact Fyers v3 place_order body for a stop-limit BUY (type 4). Single source
+    of truth: place_buy_stop_limit() sends this dict; scripts print it pre-send."""
+    return {
+        "symbol": nse(symbol),
+        "qty": int(qty),
+        "type": 4,                    # 4 = SL-L (Stop limit)
+        "side": 1,                    # 1 = Buy
+        "productType": product,       # CNC / INTRADAY / MARGIN
+        "limitPrice": float(limit),
+        "stopPrice": float(trigger),
+        "validity": validity,
+        "offlineOrder": bool(offline_order),
+        "orderTag": str(order_tag)[:20],
+    }
+
+
 class FyersClient:
     def __init__(self, app_id: str, access_token: str, log_path="logs"):
         os.makedirs(log_path, exist_ok=True)
@@ -236,6 +254,22 @@ class FyersClient:
                     out[p] = float(ltp)
         return out
 
+    def history(self, symbol, range_from, range_to, resolution="D"):
+        """Candles via fyers-apiv3 FyersModel.history. range_from/range_to are
+        'YYYY-MM-DD' (date_format=1). Fyers caps one D-resolution request at 366
+        days. Raw response: {"s": "ok", "candles": [[epoch, o, h, l, c, v], ...]}."""
+        return self.fy.history({
+            "symbol": nse(symbol), "resolution": resolution, "date_format": "1",
+            "range_from": str(range_from), "range_to": str(range_to), "cont_flag": "1",
+        })
+
+    def depth(self, symbol):
+        """Market depth incl. the day's circuit band (lower_ckt/upper_ckt). Raw response."""
+        return self.fy.depth({"symbol": nse(symbol), "ohlcv_flag": "1"})
+
+    def holdings(self):
+        return self.fy.holdings()
+
     def positions(self):
         return self.fy.positions()
 
@@ -298,6 +332,61 @@ class FyersClient:
             "orderTag": str(order_tag)[:20],
         }
         return _order_id(self.fy.place_order(data), f"buy-stop {symbol}")
+
+    def place_buy_stop_limit(
+        self,
+        symbol,
+        qty,
+        trigger,
+        limit,
+        product="CNC",
+        order_tag="cupbot",
+        allow_t2t=False,
+        **validate_kwargs,
+    ):
+        """SL-L BUY (stop-limit). Fyers: type=4, side=1. Triggers at stopPrice, then
+        rests as a limit at limitPrice — never fills above ``limit``. Prices must
+        already be exact tick multiples (no silent re-rounding: the caller sized qty
+        against these exact values). Returns the broker order id (string)."""
+        from scripts.exchange_constraints import check_tick_size
+        validity = validate_kwargs.pop("validity", "DAY")
+        offline_order = bool(validate_kwargs.pop("offline_order", False))
+        now = _resolve_now(self, validate_kwargs.pop("now", None))
+        violations = validate_order(
+            symbol,
+            "BUY",
+            qty,
+            trigger,
+            product,
+            validity,
+            allow_t2t=allow_t2t,
+            is_stop=True,
+            offline_order=offline_order,
+            order_tag=order_tag,
+            now=now,
+            **validate_kwargs,
+        )
+        ok_lim, reason_lim = check_tick_size(limit)
+        if not ok_lim:
+            violations.append(reason_lim)
+        if float(limit) < float(trigger):
+            violations.append(
+                f"sl_trigger_direction: BUY stop-limit limitPrice {limit} < stopPrice {trigger}"
+            )
+        self._enforce_preflight(
+            violations,
+            what=f"buy-stop-limit {symbol}",
+            symbol=symbol,
+            allow_t2t=allow_t2t,
+        )
+        if is_t2t_symbol(symbol) and not allow_t2t:
+            raise FyersError(
+                f"buy-stop-limit {symbol} refused: {nse(symbol)} is a T2T/BE-series delivery-only stock "
+                f"(no intraday square-off; same-day SL cannot execute)"
+            )
+        data = stop_limit_buy_payload(symbol, qty, trigger, limit, product=product, validity=validity,
+                                      offline_order=offline_order, order_tag=order_tag)
+        return _order_id(self.fy.place_order(data), f"buy-stop-limit {symbol}")
 
     def place_buy_gtt(
         self,

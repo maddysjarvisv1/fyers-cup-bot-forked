@@ -16,6 +16,7 @@ Rules (match the original cup-strategy scanner):
   - exit            : ltp <= current SL -> sell remaining
 """
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 
 SL_PCT          = 0.06   # initial stop 6% below entry
 BE_TRIGGER      = 0.10   # move to breakeven at +10%
@@ -31,6 +32,8 @@ class PosState:
     phase: str = "ACTIVE"          # ACTIVE -> BE -> TRAILING -> CLOSED
     sl: float = 0.0                # current stop-loss level
     highest: float = 0.0           # highest price seen since entry
+    time_stop_days: int = 0        # momentum rows: exit if still ACTIVE after N sessions (0 = off)
+    entry_day: str = ""            # YYYY-MM-DD the position was adopted
 
     def __post_init__(self):
         if self.sl == 0.0:
@@ -39,9 +42,21 @@ class PosState:
             self.highest = self.entry
 
 
-def step(state: PosState, ltp: float):
+def sessions_since(start_day: str, today: str) -> int:
+    """Weekday sessions strictly after start_day up to and including today.
+    NSE holidays are not modelled (a holiday counts as a session: errs early)."""
+    d, end, n = date.fromisoformat(start_day), date.fromisoformat(today), 0
+    while d < end:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            n += 1
+    return n
+
+
+def step(state: PosState, ltp: float, today: str | None = None):
     """Advance one price tick. Returns (state, actions) where actions is a list
-    of tuples: ('modify_sl', price) | ('book_partial', qty, price) | ('exit', qty, price)."""
+    of tuples: ('modify_sl', price) | ('book_partial', qty, price) | ('exit', qty, price)
+    | ('time_exit', qty, price)."""
     actions = []
     if state.phase == "CLOSED":
         return state, actions
@@ -51,6 +66,15 @@ def step(state: PosState, ltp: float):
     # 1) Stop-loss hit -> exit remaining
     if ltp <= state.sl:
         actions.append(("exit", state.qty_remaining, state.sl))
+        state.phase = "CLOSED"
+        state.qty_remaining = 0
+        return state, actions
+
+    # 1b) Time-stop (momentum rows): no breakeven within N sessions -> exit at market.
+    #     Only while ACTIVE: once at breakeven the stop already carries no risk.
+    if (state.time_stop_days and state.phase == "ACTIVE" and today and state.entry_day
+            and sessions_since(state.entry_day, today) >= state.time_stop_days):
+        actions.append(("time_exit", state.qty_remaining, ltp))
         state.phase = "CLOSED"
         state.qty_remaining = 0
         return state, actions

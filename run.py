@@ -31,7 +31,8 @@ import notify
 IST = timezone(timedelta(hours=5, minutes=30))   # India has no DST
 
 
-def load_watchlist(path="watchlist.csv", allow_t2t=False):
+def load_watchlist(path="watchlist.csv", allow_t2t=False, today=None):
+    today = today or datetime.now(IST).strftime("%Y-%m-%d")
     wl = []
     for r in csv.DictReader(open(path)):
         sym = r["symbol"].strip().upper()
@@ -44,8 +45,22 @@ def load_watchlist(path="watchlist.csv", allow_t2t=False):
             print(f"  SKIP  {sym}: T2T/BE-series symbol — same-day SL can't "
                   f"execute intraday. Set ALLOW_T2T=true in .env to include it anyway.")
             continue
-        wl.append({"symbol": sym, "rim": float(r["rim"]),
-                   "trigger": float(r["trigger"]), "qty": int(float(r["qty"]))})
+        row = {"symbol": sym, "rim": float(r["rim"]),
+               "trigger": float(r["trigger"]), "qty": int(float(r["qty"]))}
+        if (r.get("kind") or "cup").strip().lower() == "momentum":
+            # momentum_screener.py rows carry their own stop + time-stop and
+            # are valid only for the session after the signal.
+            valid_until = (r.get("valid_until") or "").strip()
+            if not valid_until or valid_until < today:
+                print(f"  SKIP  {sym}: momentum row expired (valid_until={valid_until or 'unset'})")
+                continue
+            stop = float(r["stop"])
+            if not 0 < stop < row["trigger"]:
+                raise ValueError(f"momentum row {sym}: stop {stop} must be in (0, trigger {row['trigger']})")
+            row.update(kind="momentum", stop=stop,
+                       time_stop_days=int(float(r.get("time_stop_days") or 0)),
+                       valid_until=valid_until)
+        wl.append(row)
     return wl
 
 
@@ -165,6 +180,14 @@ def main():
     _ensure_fresh_token(cfg)
     client = FyersClient.from_files()        # needs token.json (see auth.py)
     watchlist = load_watchlist(allow_t2t=allow_t2t)
+    momentum_path = env("MOMENTUM_WATCHLIST", "")      # e.g. momentum_candidates.csv; unset = cup only
+    if momentum_path:
+        cup_syms = {w["symbol"] for w in watchlist}
+        for w in load_watchlist(momentum_path, allow_t2t=allow_t2t):
+            if w["symbol"] in cup_syms:
+                print(f"  SKIP  {w['symbol']}: already a cup row — cup semantics win")
+                continue
+            watchlist.append(w)
 
     if mode == "live":
         _funds_preflight(client)
